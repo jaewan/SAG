@@ -1,0 +1,5 @@
+04/02/2011 14:30:00,1001,PrivilegeEscalation
+04/03/2011 09:45:00,1003,DataExfiltration
+04/03/2011 16:20:00,1001,LateralMovement
+04/04/2011 11:15:00,1005,Logon
+04/04/2011 22:45:00,1002,PrivilegeEscalation

@@ -1,0 +1,55 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Experiments and results (user-generated)
+experiments/
+*.pkl
+*.png
+*.jpg
+*.jpeg
+
+# Temporary files
+*.tmp
+*.temp
+debug_*.py
+create_*.py
+
+# Large data files (comment out if you want to commit synthetic data)
+# data/raw/lanl/auth.txt
+# data/raw/lanl/redteam.txt
+# *.gz
+
+# Model files
+models/
+*.pt
+*.pth
+*.h5
+*.pkl
+*.joblib
