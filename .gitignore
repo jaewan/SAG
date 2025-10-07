@@ -28,12 +28,14 @@ Thumbs.db
 *.log
 logs/
 
-# Experiments and results (user-generated)
-experiments/
+# Experiments and results (user-generated, except phase1 which demonstrates implementation)
+experiments/phase2/
+experiments/phase3/
+experiments/phase4/
 *.pkl
-*.png
 *.jpg
 *.jpeg
+*.png
 
 # Temporary files
 *.tmp
@@ -46,10 +48,12 @@ create_*.py
 # data/raw/lanl/redteam.txt
 # *.gz
 
-# Model files
-models/
+# Generated model files (not source code)
 *.pt
 *.pth
 *.h5
 *.pkl
 *.joblib
+models/*.pkl
+models/*.pt
+models/*.pth
