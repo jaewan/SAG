@@ -7,6 +7,8 @@ import pandas as pd
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 import logging
+import gc  # ✅ ADDED for garbage collection
+import psutil  # ✅ ADDED for memory monitoring
 from sklearn.model_selection import StratifiedKFold, GroupKFold
 from scipy import stats
 import matplotlib.pyplot as plt
@@ -24,10 +26,13 @@ class ContextWindowAnalyzer:
     def __init__(self,
                  n_values: List[int] = None,
                  cv_folds: int = 5,
-                 min_malicious_per_fold: int = 2):
+                 min_malicious_per_fold: int = 2,
+                 cache_tokenization: bool = True):
         self.n_values = n_values or [1, 2, 3, 5, 10, 25]
         self.cv_folds = cv_folds
         self.min_malicious_per_fold = min_malicious_per_fold
+        self.cache_tokenization = cache_tokenization
+        self._token_cache = {}  # ✅ ADDED: Simple tokenization cache
 
     def analyze(self,
                 benign_sessions: List[Dict],
@@ -87,6 +92,13 @@ class ContextWindowAnalyzer:
 
         # Plots
         self._plot_results(results)
+
+        # ✅ ADDED: Clear tokenization cache to free memory
+        if self.cache_tokenization:
+            cache_size = len(self._token_cache)
+            self._token_cache.clear()
+            logger.info(f"🗑️ Cleared tokenization cache ({cache_size} entries)")
+
         return results, decision
 
     def _check_sample_size(self, n_benign: int, n_malicious: int) -> bool:
@@ -156,6 +168,18 @@ class ContextWindowAnalyzer:
         Format: <auth_type>_<outcome>_<user_type>_<host_pattern>
         Example: "Kerberos_Success_regular_single"
         """
+        # ✅ ADDED: Simple caching for tokenization
+        if self.cache_tokenization:
+            # Create cache key from session characteristics
+            cache_key = (
+                session['user_id'],
+                len(session['events']),
+                tuple(sorted(set(e['dst_computer'] for e in session['events'])))[:5]  # First 5 hosts
+            )
+
+            if cache_key in self._token_cache:
+                return self._token_cache[cache_key]
+
         tokens = []
 
         # Infer user type (admin/regular/service)
@@ -179,6 +203,10 @@ class ContextWindowAnalyzer:
         for event in session['events']:
             token = f"{event['auth_type']}_{event['outcome']}_{user_type}_{host_pattern}"
             tokens.append(token)
+
+        # ✅ ADDED: Cache the result
+        if self.cache_tokenization:
+            self._token_cache[cache_key] = tokens
 
         return tokens
 
@@ -228,6 +256,17 @@ class ContextWindowAnalyzer:
             splits = cv.split(all_sessions, y)
 
         for fold_idx, (train_idx, test_idx) in enumerate(splits):
+            logger.info(f"\n Fold {fold_idx+1}/{self.cv_folds}:")
+
+            # ✅ ADDED: Memory monitoring before each fold
+            try:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                mem_gb = mem_info.rss / 1024 / 1024 / 1024
+                logger.info(f" 💾 Memory before fold: {mem_gb:.2f} GB")
+            except:
+                pass
+
             # Indices of benign in train
             train_benign_idx = [i for i in train_idx if y[i] == 0]
             train_sessions = [all_sessions[i] for i in train_benign_idx]
@@ -235,7 +274,6 @@ class ContextWindowAnalyzer:
             test_labels = y[test_idx]
             n_test_mal = (test_labels == 1).sum()
 
-            logger.info(f"\n Fold {fold_idx+1}/{self.cv_folds}:")
             logger.info(f" Train: {len(train_sessions)} benign")
             logger.info(f" Test: {(test_labels==0).sum()} benign, {n_test_mal} malicious")
 
@@ -256,6 +294,9 @@ class ContextWindowAnalyzer:
                 model.fit(train_seqs)
             except Exception as e:
                 logger.error(f" ❌ Fit failed: {e}")
+                # ✅ ADDED: Cleanup on failure
+                del train_seqs, test_seqs
+                gc.collect()
                 continue
 
             # Evaluate
@@ -265,7 +306,25 @@ class ContextWindowAnalyzer:
                 logger.info(f" AUC: {metrics['auc']:.3f}, TPR@10%: {metrics['tpr_at_10fpr']:.3f}")
             except Exception as e:
                 logger.warning(f" ⚠️ Eval failed: {e}")
+                # ✅ ADDED: Cleanup on failure
+                del model
+                gc.collect()
                 continue
+
+            # ✅ ADDED: Aggressive cleanup after each fold
+            del train_sessions, test_sessions, train_seqs, test_seqs, test_benign_seqs, test_mal_seqs
+            if 'model' in locals():
+                del model
+            gc.collect()
+
+            # ✅ ADDED: Memory monitoring after each fold
+            try:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                mem_gb = mem_info.rss / 1024 / 1024 / 1024
+                logger.info(f" 💾 Memory after fold: {mem_gb:.2f} GB")
+            except:
+                pass
 
         if len(fold_results) == 0:
             raise RuntimeError(f"All {self.cv_folds} folds failed for n={n}")

@@ -32,17 +32,31 @@ class LANLValidator:
 
         # Read CSV - handle both with and without headers
         try:
-            df = pd.read_csv(self.auth_file, nrows=10000, header=None)
-            # Assume no headers and assign column names based on position
-            df.columns = ['time', 'user_id', 'src_comp_id', 'dst_comp_id', 'auth_type', 'outcome']
-        except:
-            # Try with headers
-            df = pd.read_csv(self.auth_file, nrows=10000)
-            # Check required columns
-            required_cols = ['time', 'user_id', 'src_comp_id', 'dst_comp_id', 'auth_type', 'outcome']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                logger.error(f"❌ Missing columns: {missing_cols}")
+            df = pd.read_csv(self.auth_file, nrows=10000, header=None, on_bad_lines='skip')
+            # Assume no headers and assign column names based on LANL format
+            # LANL auth.txt format: time,user_id,src_comp_id,dst_comp_id,src_domain,auth_type,log_type,log_action,outcome
+            df.columns = ['time', 'user_id', 'src_comp_id', 'dst_comp_id', 'src_domain', 'auth_type', 'log_type', 'log_action', 'outcome']
+
+            # Filter out rows where time is not numeric (malformed data)
+            df = df[pd.to_numeric(df['time'], errors='coerce').notna()]
+            logger.info(f"✅ Loaded {len(df)} valid rows for timestamp detection")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to read auth file: {e}")
+            return False, datetime(2011, 4, 1, 0, 0, 0)
+
+        # Try with headers as fallback
+        if len(df) == 0:
+            try:
+                df = pd.read_csv(self.auth_file, nrows=10000)
+                # Check required columns
+                required_cols = ['time', 'user_id', 'src_comp_id', 'dst_comp_id', 'auth_type', 'outcome']
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                if missing_cols:
+                    logger.error(f"❌ Missing columns: {missing_cols}")
+                    return False, datetime(2011, 4, 1, 0, 0, 0)
+            except Exception as e:
+                logger.error(f"❌ Failed to read auth file with headers: {e}")
                 return False, datetime(2011, 4, 1, 0, 0, 0)
 
         # Detect start time
@@ -52,13 +66,17 @@ class LANLValidator:
         ]
 
         for start in candidates:
-            df['timestamp'] = start + pd.to_timedelta(df['time'], unit='s')
+            try:
+                df['timestamp'] = start + pd.to_timedelta(df['time'], unit='s')
 
-            # Check: Does first event fall on start date?
-            first_date = df['timestamp'].iloc[0].date()
-            if first_date == start.date():
-                logger.info(f"✅ Detected start time: {start}")
-                return True, start  # RETURN IT
+                # Check: Does first event fall on start date?
+                first_date = df['timestamp'].iloc[0].date()
+                if first_date == start.date():
+                    logger.info(f"✅ Detected start time: {start}")
+                    return True, start  # RETURN IT
+            except (ValueError, TypeError) as e:
+                logger.warning(f"⚠️ Failed to parse timestamps with start time {start}: {e}")
+                continue
 
         logger.warning("⚠️ Could not auto-detect start time, using midnight")
         return True, datetime(2011, 4, 1, 0, 0, 0)
@@ -178,20 +196,18 @@ class LANLLoader:
                 continue
 
             try:
-                # Handle LANL format: time (seconds), user_id, src_comp_id, dst_comp_id, auth_type, outcome
+                # Handle LANL format: time,user_id,src_comp_id,dst_comp_id,src_domain,auth_type,log_type,log_action,outcome
                 # Convert time from seconds to timestamp using the start_date from validation
                 timestamp_seconds = int(parts[0])
                 timestamp = self.start_date + pd.Timedelta(seconds=timestamp_seconds)
 
                 row = {
                     'timestamp': timestamp,
-                    'user_id': int(parts[1]),
-                    'src_computer': parts[2],
-                    'dst_computer': parts[3],
-                    'auth_type': parts[4],
-                    'logon_type': parts[4],  # Use auth_type as logon_type for now
-                    'auth_orientation': 'LogOn',  # Default value
-                    'outcome': parts[5]
+                    'user_id': parts[1],  # Keep as string - user identifiers like "ANONYMOUS LOGON@C586"
+                    'src_comp_id': parts[2],  # Source computer
+                    'dst_comp_id': parts[3],  # Destination computer
+                    'auth_type': parts[5],    # Authentication type (NTLM, Kerberos, etc.)
+                    'outcome': parts[8] if len(parts) > 8 else 'Unknown'  # Success/Failure
                 }
                 rows.append(row)
 
