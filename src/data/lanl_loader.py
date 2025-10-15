@@ -5,6 +5,7 @@ Handles loading and preprocessing of LANL authentication and red team data
 
 import pandas as pd
 import numpy as np
+import random
 from pathlib import Path
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
@@ -34,8 +35,8 @@ class LANLValidator:
         try:
             df = pd.read_csv(self.auth_file, nrows=10000, header=None, on_bad_lines='skip')
             # Assume no headers and assign column names based on LANL format
-            # LANL auth.txt format: time,user_id,src_comp_id,dst_comp_id,src_domain,auth_type,log_type,log_action,outcome
-            df.columns = ['time', 'user_id', 'src_comp_id', 'dst_comp_id', 'src_domain', 'auth_type', 'log_type', 'log_action', 'outcome']
+            # LANL auth.txt format: time,user_id,src_computer,dst_computer,src_domain,auth_type,log_type,log_action,outcome
+            df.columns = ['time', 'user_id', 'src_computer', 'dst_computer', 'src_domain', 'auth_type', 'log_type', 'log_action', 'outcome']
 
             # Filter out rows where time is not numeric (malformed data)
             df = df[pd.to_numeric(df['time'], errors='coerce').notna()]
@@ -50,7 +51,7 @@ class LANLValidator:
             try:
                 df = pd.read_csv(self.auth_file, nrows=10000)
                 # Check required columns
-                required_cols = ['time', 'user_id', 'src_comp_id', 'dst_comp_id', 'auth_type', 'outcome']
+                required_cols = ['time', 'user_id', 'src_computer', 'dst_computer', 'auth_type', 'outcome']
                 missing_cols = [col for col in required_cols if col not in df.columns]
                 if missing_cols:
                     logger.error(f"❌ Missing columns: {missing_cols}")
@@ -128,7 +129,94 @@ class LANLLoader:
 
         self.auth_file = self.data_dir / "auth.txt"
         self.auth_gz_file = self.data_dir / "auth.txt.gz"
+        self.proc_file = self.data_dir / "proc.txt"
+        self.flows_file = self.data_dir / "flows.txt"
+        self.dns_file = self.data_dir / "dns.txt"
         self.redteam_file = self.data_dir / "redteam.txt"
+
+    def extract_computer_id(self, computer_str: str) -> str:
+        """Robust computer ID extraction from various formats"""
+        if not computer_str:
+            return ""
+
+        computer_str = str(computer_str).strip()
+
+        # Handle format: "ANONYMOUS LOGON@C586"
+        if '@' in computer_str:
+            computer_str = computer_str.split('@')[-1]
+
+        # Handle format: "DOMAIN\\USER@COMP"
+        if '\\' in computer_str:
+            computer_str = computer_str.split('\\')[-1]
+
+        # Extract computer ID (assuming C#### format)
+        import re
+        match = re.search(r'C\d+', computer_str)
+        if match:
+            return match.group(0)
+
+        # If no standard format, return the cleaned string
+        # Remove common prefixes that aren't computer IDs
+        prefixes_to_remove = ['ANONYMOUS LOGON', 'USER', 'DOMAIN']
+        for prefix in prefixes_to_remove:
+            if computer_str.startswith(prefix):
+                computer_str = computer_str[len(prefix):].strip()
+
+        return computer_str if computer_str else ""
+
+    def analyze_correlation_quality(self, correlated_events: List[dict]) -> dict:
+        """Verify correlation is working correctly"""
+        if not correlated_events:
+            return {
+                'total_events': 0,
+                'with_processes': 0,
+                'with_flows': 0,
+                'with_dns': 0,
+                'correlation_rate': 0.0,
+                'status': 'empty'
+            }
+
+        total_events = len(correlated_events)
+        with_processes = sum(1 for e in correlated_events if len(e['related_processes']) > 0)
+        with_flows = sum(1 for e in correlated_events if len(e['related_flows']) > 0)
+        with_dns = sum(1 for e in correlated_events if len(e['related_dns']) > 0)
+
+        # Calculate meaningful correlation rate (events with at least some context)
+        with_any_context = sum(1 for e in correlated_events
+                              if len(e['related_processes']) > 0 or
+                                 len(e['related_flows']) > 0 or
+                                 len(e['related_dns']) > 0)
+
+        correlation_rate = with_any_context / total_events if total_events > 0 else 0.0
+
+        quality_report = {
+            'total_events': total_events,
+            'with_processes': with_processes,
+            'with_flows': with_flows,
+            'with_dns': with_dns,
+            'with_any_context': with_any_context,
+            'correlation_rate': correlation_rate,
+            'status': 'good' if correlation_rate > 0.05 else 'poor'  # At least 5% should have context
+        }
+
+        logger.info("Correlation quality:")
+        logger.info(f"  Events with processes: {with_processes/total_events*100:.1f}%")
+        logger.info(f"  Events with flows: {with_flows/total_events*100:.1f}%")
+        logger.info(f"  Events with DNS: {with_dns/total_events*100:.1f}%")
+        logger.info(f"  Events with any context: {with_any_context/total_events*100:.1f}%")
+
+        if correlation_rate < 0.01:  # Less than 1% have context
+            logger.error("❌ Correlation failing - very few events have related data!")
+            logger.error("   This suggests:")
+            logger.error("   1. Timestamp formats don't match across files")
+            logger.error("   2. Computer ID formats are inconsistent")
+            logger.error("   3. Correlation windows are too narrow")
+        elif correlation_rate < 0.05:  # Less than 5% have context
+            logger.warning("⚠️ Low correlation rate - check data formats and timing")
+        else:
+            logger.info("✅ Correlation working well")
+
+        return quality_report
 
     def load_sample(self, days: Optional[List[int]] = None, max_rows: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -143,8 +231,9 @@ class LANLLoader:
         """
         logger.info(f"Loading LANL data from {self.data_dir}")
 
-        # Load authentication data
-        auth_df = self._load_auth_data()
+        # ✅ CRITICAL FIX: Apply max_rows during loading to prevent OOM
+        # Load authentication data with row limit
+        auth_df = self._load_auth_data(max_rows=max_rows)
         logger.info(f"Loaded {len(auth_df):,} auth events")
 
         # Load red team data
@@ -160,30 +249,198 @@ class LANLLoader:
             redteam_df = self._filter_by_days(redteam_df, days)
             logger.info(f"Filtered to days {min(days)}-{max(days)}: {len(auth_df):,} auth, {len(redteam_df)} red team")
 
-        # Limit rows if specified (for testing)
-        if max_rows is not None:
-            auth_df = auth_df.head(max_rows).copy()
-            logger.info(f"Limited to {max_rows:,} rows for testing")
+        return auth_df, redteam_df
+
+    def load_sample_stratified(self, attack_days: List[int], max_rows: int,
+                              attack_focus_ratio: float = 0.7, time_strata: int = 6) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Load auth data using stratified sampling focused on attack periods.
+
+        Args:
+            attack_days: List of attack days to prioritize
+            max_rows: Maximum total rows to sample
+            attack_focus_ratio: Fraction of samples from attack periods (0.0-1.0)
+            time_strata: Number of time periods to stratify across
+
+        Returns:
+            Tuple of (auth_df, redteam_df) with attack-focused sampling
+        """
+        logger.info(f"🎯 Stratified sampling: {len(attack_days)} attack days, {max_rows:,} max rows")
+        logger.info(f"   Attack focus: {attack_focus_ratio:.1%}, Time strata: {time_strata}")
+
+        # Load red team data first to identify attack periods
+        redteam_df = self._load_redteam_data()
+
+        # Define attack periods (attack days ± 1 day buffer)
+        attack_buffer_days = 1
+        attack_periods = set()
+        for attack_day in attack_days:
+            for buffer in range(-attack_buffer_days, attack_buffer_days + 1):
+                attack_periods.add(attack_day + buffer)
+        attack_periods = sorted(list(attack_periods))
+
+        logger.info(f"📅 Attack periods: {len(attack_periods)} days ({attack_periods[0]}-{attack_periods[-1]})")
+
+        # Calculate samples per stratum
+        attack_samples = int(max_rows * attack_focus_ratio)
+        benign_samples = max_rows - attack_samples
+
+        # Sample from attack periods (70% of samples)
+        attack_auth_df = self._sample_from_periods(attack_periods, attack_samples)
+
+        # Sample from remaining periods (30% of samples) for benign context
+        all_days = set(range(1, 366))  # Assuming up to day 365
+        benign_periods = sorted(list(all_days - set(attack_periods)))
+        logger.info(f"📅 Benign periods: {len(benign_periods)} days")
+
+        benign_auth_df = self._sample_from_periods(benign_periods, benign_samples)
+
+        # Combine and shuffle
+        combined_df = pd.concat([attack_auth_df, benign_auth_df], ignore_index=True)
+        combined_df = combined_df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        # Filter to requested attack days for final red team data
+        redteam_df = redteam_df[redteam_df['day'].isin(attack_days)].reset_index(drop=True)
+
+        logger.info(f"✅ Stratified sampling complete:")
+        logger.info(f"   Attack periods: {len(attack_auth_df):,} auth events")
+        logger.info(f"   Benign periods: {len(benign_auth_df):,} auth events")
+        logger.info(f"   Red team events: {len(redteam_df)}")
+
+        return combined_df, redteam_df
+
+    def _sample_from_periods(self, target_days: List[int], target_samples: int) -> pd.DataFrame:
+        """Sample auth data from specific days using reservoir sampling"""
+        if not target_days:
+            return pd.DataFrame()
+
+        logger.info(f"🎲 Sampling {target_samples:,} rows from {len(target_days)} days...")
+
+        # Use reservoir sampling to efficiently sample large datasets
+        reservoir = []
+        total_seen = 0
+
+        # Read auth file and sample from target days
+        if self.auth_gz_file.exists():
+            file_handle = gzip.open(self.auth_gz_file, 'rt')
+        elif self.auth_file.exists():
+            file_handle = open(self.auth_file, 'r')
+        else:
+            raise FileNotFoundError(f"Auth file not found: {self.auth_file} or {self.auth_gz_file}")
+
+        try:
+            for line_num, line in enumerate(file_handle):
+                if line_num % 1_000_000 == 0 and line_num > 0:
+                    logger.info(f"   Processed {line_num:,} lines...")
+
+                parts = line.strip().split(',')
+                if len(parts) < 6:
+                    continue
+
+                try:
+                    # Convert time to day for filtering
+                    timestamp_seconds = int(parts[0])
+                    timestamp = pd.Timestamp(self.start_date) + pd.Timedelta(seconds=timestamp_seconds)
+                    event_day = timestamp.dayofyear
+
+                    if event_day in target_days:
+                        total_seen += 1
+
+                        # Reservoir sampling
+                        if len(reservoir) < target_samples:
+                            reservoir.append(line.strip())
+                        else:
+                            # Replace random element with probability target_samples/total_seen
+                            if random.random() < target_samples / total_seen:
+                                replace_idx = random.randint(0, target_samples - 1)
+                                reservoir[replace_idx] = line.strip()
+
+                except (ValueError, IndexError):
+                    continue
+
+        finally:
+            file_handle.close()
+
+        logger.info(f"   Found {total_seen:,} events in target days")
+        logger.info(f"   Sampled {len(reservoir):,} events using reservoir sampling")
+
+        # Convert reservoir to DataFrame
+        if not reservoir:
+            return pd.DataFrame()
+
+        # Parse the sampled lines into DataFrame
+        rows = []
+        for line in reservoir:
+            parts = line.split(',')
+            if len(parts) >= 6:
+                try:
+                    timestamp_seconds = int(parts[0])
+                    timestamp = pd.Timestamp(self.start_date) + pd.Timedelta(seconds=timestamp_seconds)
+
+                    row = {
+                        'timestamp': timestamp,
+                        'user_id': parts[1],
+                        'src_computer': parts[2],
+                        'dst_computer': parts[3],
+                        'auth_type': parts[5],
+                        'outcome': parts[8] if len(parts) > 8 else 'Unknown'
+                    }
+                    rows.append(row)
+                except (ValueError, IndexError):
+                    continue
+
+        df = pd.DataFrame(rows)
+        if len(df) > 0:
+            df['day'] = df['timestamp'].dt.dayofyear
+
+        logger.info(f"✅ Successfully parsed {len(df):,} events from target days")
+        return df
+
+    def load_sample_flexible(self, attack_day: int, auth_window_days: int = 3, max_rows: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Load data with flexible auth window around attack day
+
+        Args:
+            attack_day: Day with red team attacks
+            auth_window_days: Number of days to load auth data around attack day
+            max_rows: Maximum auth rows to load
+        """
+        logger.info(f"Loading data around attack day {attack_day}")
+
+        # Load auth data from a window around the attack day
+        auth_start_day = max(1, attack_day - auth_window_days // 2)
+        auth_end_day = attack_day + auth_window_days // 2
+        auth_days = list(range(auth_start_day, auth_end_day + 1))
+
+        auth_df = self._load_auth_data(max_rows=max_rows)
+        auth_df = self._filter_by_days(auth_df, auth_days)
+
+        # Load all red team data and filter to attack day
+        redteam_df = self._load_redteam_data()
+        redteam_df = self._filter_by_days(redteam_df, [attack_day])
+
+        logger.info(f"Loaded {len(auth_df):,} auth events from days {auth_start_day}-{auth_end_day}")
+        logger.info(f"Loaded {len(redteam_df)} red team events from day {attack_day}")
 
         return auth_df, redteam_df
 
-    def _load_auth_data(self) -> pd.DataFrame:
+    def _load_auth_data(self, max_rows: Optional[int] = None) -> pd.DataFrame:
         """Load authentication events"""
         # Try gzipped first, then uncompressed
         if self.auth_gz_file.exists():
             logger.info(f"Loading from {self.auth_gz_file}")
             with gzip.open(self.auth_gz_file, 'rt') as f:
-                df = self._parse_auth_file(f)
+                df = self._parse_auth_file(f, max_rows=max_rows)
         elif self.auth_file.exists():
             logger.info(f"Loading from {self.auth_file}")
             with open(self.auth_file, 'r') as f:
-                df = self._parse_auth_file(f)
+                df = self._parse_auth_file(f, max_rows=max_rows)
         else:
             raise FileNotFoundError(f"Auth file not found: {self.auth_file} or {self.auth_gz_file}")
 
         return df
 
-    def _parse_auth_file(self, file_handle) -> pd.DataFrame:
+    def _parse_auth_file(self, file_handle, max_rows: Optional[int] = None) -> pd.DataFrame:
         """Parse authentication file into DataFrame"""
         rows = []
 
@@ -191,23 +448,31 @@ class LANLLoader:
             if line_num % 1000000 == 0 and line_num > 0:
                 logger.info(f"Parsed {line_num:,} lines...")
 
+            # ✅ CRITICAL FIX: Stop parsing if we've reached max_rows
+            if max_rows is not None and len(rows) >= max_rows:
+                logger.info(f"Reached max_rows limit ({max_rows:,}), stopping parsing")
+                break
+
             parts = line.strip().split(',')
-            if len(parts) < 6:
+            if len(parts) < 9:  # LANL auth.txt has 9 columns
                 continue
 
             try:
-                # Handle LANL format: time,user_id,src_comp_id,dst_comp_id,src_domain,auth_type,log_type,log_action,outcome
+                # Handle LANL format: time,user_id,src_computer,dst_computer,src_domain,auth_type,log_type,log_action,outcome
                 # Convert time from seconds to timestamp using the start_date from validation
                 timestamp_seconds = int(parts[0])
                 timestamp = self.start_date + pd.Timedelta(seconds=timestamp_seconds)
 
                 row = {
                     'timestamp': timestamp,
-                    'user_id': parts[1],  # Keep as string - user identifiers like "ANONYMOUS LOGON@C586"
-                    'src_comp_id': parts[2],  # Source computer
-                    'dst_comp_id': parts[3],  # Destination computer
+                    'user_id': parts[1],      # User identifier
+                    'src_computer': parts[2], # Source computer
+                    'dst_computer': parts[3], # Destination computer
+                    'src_domain': parts[4],   # Source domain
                     'auth_type': parts[5],    # Authentication type (NTLM, Kerberos, etc.)
-                    'outcome': parts[8] if len(parts) > 8 else 'Unknown'  # Success/Failure
+                    'log_type': parts[6],     # Log type (Network, Service, etc.)
+                    'log_action': parts[7],   # Log action (LogOn, LogOff, etc.)
+                    'outcome': parts[8]       # Success/Failure
                 }
                 rows.append(row)
 
@@ -231,25 +496,504 @@ class LANLLoader:
         """Load red team attack labels"""
         if not self.redteam_file.exists():
             logger.warning(f"Red team file not found: {self.redteam_file}")
-            return pd.DataFrame(columns=['timestamp', 'user_id', 'action', 'day'])
+            return pd.DataFrame(columns=['time', 'user', 'src_computer', 'dst_computer', 'timestamp', 'day'])
 
         logger.info(f"Loading red team data from {self.redteam_file}")
 
         try:
-            df = pd.read_csv(self.redteam_file, header=None, names=['timestamp', 'user_id', 'action'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')
+            df = pd.read_csv(self.redteam_file, header=None, names=['time', 'user', 'src_computer', 'dst_computer'])
+
+            # Convert time from seconds to timestamp using the start_date from validation
+            df['timestamp'] = self.start_date + pd.to_timedelta(df['time'], unit='s')
             df['day'] = df['timestamp'].dt.dayofyear
+
+            # Add user_id column for compatibility with auth events
+            df['user_id'] = df['user']
 
             logger.info(f"Loaded {len(df)} red team events")
             return df
 
         except Exception as e:
             logger.error(f"Failed to load red team data: {e}")
-            return pd.DataFrame(columns=['timestamp', 'user_id', 'action', 'day'])
+            return pd.DataFrame(columns=['time', 'user', 'src_computer', 'dst_computer', 'timestamp', 'day', 'user_id'])
+
+    def _load_proc_data(self, max_rows: Optional[int] = None) -> pd.DataFrame:
+        """Load process execution data"""
+        if not self.proc_file.exists():
+            logger.warning(f"Process file not found: {self.proc_file}")
+            return pd.DataFrame(columns=['time', 'user_id', 'computer', 'process_name', 'parent_process', 'timestamp', 'day'])
+
+        logger.info(f"Loading process data from {self.proc_file}")
+
+        try:
+            rows = []
+            with open(self.proc_file, 'r') as f:
+                for line_num, line in enumerate(f):
+                    if max_rows is not None and len(rows) >= max_rows:
+                        logger.info(f"Reached max_rows limit ({max_rows:,}), stopping parsing")
+                        break
+
+                    parts = line.strip().split(',')
+                    if len(parts) < 5:  # LANL proc.txt has 5 columns
+                        continue
+
+                    try:
+                        # LANL proc.txt format: time,user_id,computer,process_name,parent_process
+                        timestamp_seconds = int(parts[0])
+                        timestamp = self.start_date + pd.Timedelta(seconds=timestamp_seconds)
+
+                        row = {
+                            'timestamp': timestamp,
+                            'user_id': parts[1],
+                            'computer': parts[2],
+                            'process_name': parts[3],
+                            'parent_process': parts[4]
+                        }
+                        rows.append(row)
+
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Skipping malformed process line {line_num}: {e}")
+                        continue
+
+            df = pd.DataFrame(rows)
+            df['day'] = df['timestamp'].dt.dayofyear
+
+            logger.info(f"Loaded {len(df)} process events")
+            return df
+
+        except Exception as e:
+            logger.error(f"Failed to load process data: {e}")
+            return pd.DataFrame(columns=['time', 'user_id', 'computer', 'process_name', 'parent_process', 'timestamp', 'day'])
+
+    def _load_flows_data(self, max_rows: Optional[int] = None) -> pd.DataFrame:
+        """Load network flow data"""
+        if not self.flows_file.exists():
+            logger.warning(f"Flows file not found: {self.flows_file}")
+            return pd.DataFrame()
+
+        logger.info(f"Loading flows data from {self.flows_file}")
+
+        rows = []
+        with open(self.flows_file, 'r') as f:
+            for line_num, line in enumerate(f):
+                if max_rows is not None and len(rows) >= max_rows:
+                    logger.info(f"Reached max_rows limit ({max_rows:,}), stopping parsing")
+                    break
+
+                parts = line.strip().split(',')
+                if len(parts) < 9:
+                    continue
+
+                try:
+                    # Validate that we have the expected number of fields
+                    if len(parts) != 9:
+                        logger.debug(f"Skipping line {line_num}: wrong number of fields ({len(parts)})")
+                        continue
+
+                    # Validate timestamp field (should be a number)
+                    try:
+                        timestamp_seconds = int(parts[0])
+                    except ValueError:
+                        logger.debug(f"Skipping line {line_num}: invalid timestamp '{parts[0]}'")
+                        continue
+
+                    # Validate duration field (should be a number)
+                    try:
+                        duration = float(parts[1])
+                    except ValueError:
+                        logger.debug(f"Skipping line {line_num}: invalid duration '{parts[1]}'")
+                        continue
+
+                    # Validate computer names (should start with 'C' followed by digits)
+                    src_computer = parts[2]
+                    dst_computer = parts[3]
+
+                    if not (src_computer.startswith('C') and src_computer[1:].isdigit()):
+                        logger.debug(f"Skipping line {line_num}: invalid src_computer '{src_computer}'")
+                        continue
+
+                    if not (dst_computer.startswith('C') and dst_computer[1:].isdigit()):
+                        logger.debug(f"Skipping line {line_num}: invalid dst_computer '{dst_computer}'")
+                        continue
+
+                    # Validate remaining numeric fields
+                    try:
+                        src_port = int(parts[4])
+                        dst_port = int(parts[5])
+                        protocol = int(parts[6])
+                        packet_count = int(parts[7])
+                        byte_count = int(parts[8])
+                    except ValueError as e:
+                        logger.debug(f"Skipping line {line_num}: invalid numeric field: {e}")
+                        continue
+
+                    timestamp = self.start_date + pd.Timedelta(seconds=timestamp_seconds)
+
+                    row = {
+                        'timestamp': timestamp,
+                        'duration': duration,
+                        'src_computer': src_computer,
+                        'dst_computer': dst_computer,
+                        'src_port': src_port,
+                        'dst_port': dst_port,
+                        'protocol': protocol,
+                        'packet_count': packet_count,
+                        'byte_count': byte_count
+                    }
+                    rows.append(row)
+
+                except Exception as e:
+                    # Only log every 1000th malformed line to avoid spam
+                    if line_num % 1000 == 0:
+                        logger.warning(f"Skipping malformed flow line {line_num}: {e}")
+                    continue
+
+        if not rows:
+            logger.warning("No valid flow events loaded")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df['day'] = df['timestamp'].dt.dayofyear
+
+        logger.info(f"Loaded {len(df)} flow events")
+        return df
+
+    def _load_dns_data(self, max_rows: Optional[int] = None) -> pd.DataFrame:
+        """Load DNS query data"""
+        if not self.dns_file.exists():
+            logger.warning(f"DNS file not found: {self.dns_file}")
+            return pd.DataFrame()
+
+        logger.info(f"Loading DNS data from {self.dns_file}")
+
+        rows = []
+        with open(self.dns_file, 'r') as f:
+            for line_num, line in enumerate(f):
+                if max_rows is not None and len(rows) >= max_rows:
+                    logger.info(f"Reached max_rows limit ({max_rows:,}), stopping parsing")
+                    break
+
+                parts = line.strip().split(',')
+                if len(parts) < 4:
+                    continue
+
+                try:
+                    # Skip lines with malformed computer names
+                    src_computer = parts[1]
+                    dst_computer = parts[2]
+
+                    # Skip if computer names are malformed (like 'C' without digits)
+                    if (src_computer.startswith('C') and not src_computer[1:].isdigit()) or \
+                       (dst_computer.startswith('C') and not dst_computer[1:].isdigit()):
+                        continue
+
+                    # LANL dns.txt format: time,src_computer,dst_computer,domain
+                    timestamp_seconds = int(parts[0])
+                    timestamp = self.start_date + pd.Timedelta(seconds=timestamp_seconds)
+
+                    row = {
+                        'timestamp': timestamp,
+                        'src_computer': src_computer,
+                        'dst_computer': dst_computer,
+                        'domain': parts[3]
+                    }
+                    rows.append(row)
+
+                except (ValueError, IndexError) as e:
+                    if line_num % 1000 == 0:
+                        logger.warning(f"Skipping malformed DNS line {line_num}: {e}")
+                    continue
+
+        if not rows:
+            logger.warning("No valid DNS events loaded")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df['day'] = df['timestamp'].dt.dayofyear
+
+        logger.info(f"Loaded {len(df)} DNS events")
+        return df
 
     def _filter_by_days(self, df: pd.DataFrame, days: List[int]) -> pd.DataFrame:
         """Filter DataFrame to specific days"""
+        if len(df) == 0 or 'day' not in df.columns:
+            return df
         return df[df['day'].isin(days)].copy()
+
+    def load_full_context(self, days: Optional[List[int]] = None, max_rows: Optional[int] = None,
+                         correlation_window_sec: int = 300) -> Tuple[List[dict], dict]:
+        """
+        Load and correlate all LANL data sources for semantic analysis
+
+        Args:
+            days: List of days to load (1-58). If None, load all.
+            max_rows: Maximum rows to load per source (for testing)
+            correlation_window_sec: Time window for correlating events (± seconds)
+
+        Returns:
+            List of correlated event dictionaries with enriched context
+        """
+        logger.info(f"🔗 Loading full context with correlation window ±{correlation_window_sec}s")
+
+        # Load all data sources
+        auth_df = self._load_auth_data(max_rows=max_rows)
+        proc_df = self._load_proc_data(max_rows=max_rows)
+        flows_df = self._load_flows_data(max_rows=max_rows)
+        dns_df = self._load_dns_data(max_rows=max_rows)
+        redteam_df = self._load_redteam_data()
+
+        logger.info(f"Loaded: auth={len(auth_df):,}, proc={len(proc_df):,}, flows={len(flows_df):,}, dns={len(dns_df):,}")
+
+        # Check if we have any auth data (required for correlation)
+        if len(auth_df) == 0:
+            logger.error("No auth data loaded - cannot create correlated events")
+            return []
+
+        # Filter by days if specified
+        if days is not None:
+            auth_df = self._filter_by_days(auth_df, days)
+            proc_df = self._filter_by_days(proc_df, days)
+            flows_df = self._filter_by_days(flows_df, days)
+            dns_df = self._filter_by_days(dns_df, days)
+            redteam_df = self._filter_by_days(redteam_df, days)
+            logger.info(f"Filtered to days {min(days)}-{max(days)}")
+
+        # Sort all dataframes by timestamp for efficient correlation
+        auth_df = auth_df.sort_values('timestamp').reset_index(drop=True)
+        if len(proc_df) > 0:
+            proc_df = proc_df.sort_values('timestamp').reset_index(drop=True)
+        if len(flows_df) > 0:
+            flows_df = flows_df.sort_values('timestamp').reset_index(drop=True)
+        if len(dns_df) > 0:
+            dns_df = dns_df.sort_values('timestamp').reset_index(drop=True)
+
+        # Build correlated events around authentication events (primary events)
+        correlated_events = []
+
+        for idx, auth_event in auth_df.iterrows():
+            if idx % 10000 == 0 and idx > 0:
+                logger.info(f"Correlated {idx:,}/{len(auth_df):,} auth events...")
+
+            correlated_event = {
+                'timestamp': auth_event['timestamp'],
+                'auth_event': auth_event.to_dict(),
+                'related_processes': [],
+                'related_flows': [],
+                'related_dns': [],
+                'is_malicious': False
+            }
+
+            # Find related events within correlation window
+            window_start = auth_event['timestamp'] - pd.Timedelta(seconds=correlation_window_sec)
+            window_end = auth_event['timestamp'] + pd.Timedelta(seconds=correlation_window_sec)
+
+            # Find processes for same user and computer using robust extraction
+            auth_user = str(auth_event['user_id'])
+            auth_computer = auth_event['src_computer']
+            auth_computer_clean = self.extract_computer_id(auth_computer)
+
+            # Match processes to auth events with improved logic
+            related_proc = self._find_related_processes(
+                proc_df, auth_user, auth_computer_clean, window_start, window_end
+            )
+            correlated_event['related_processes'] = related_proc.to_dict('records')
+
+            # Find network flows for same computer using robust extraction
+            if len(flows_df) > 0:
+                auth_computer_clean = self.extract_computer_id(auth_computer)
+                related_flows = self._find_related_flows(
+                    flows_df, auth_computer_clean, window_start, window_end
+                )
+                correlated_event['related_flows'] = related_flows.to_dict('records')
+            else:
+                correlated_event['related_flows'] = []
+
+            # Find DNS queries for same computer using robust extraction
+            if len(dns_df) > 0:
+                auth_computer_clean = self.extract_computer_id(auth_computer)
+                related_dns = self._find_related_dns(
+                    dns_df, auth_computer_clean, window_start, window_end
+                )
+                correlated_event['related_dns'] = related_dns.to_dict('records')
+            else:
+                correlated_event['related_dns'] = []
+
+            correlated_events.append(correlated_event)
+
+        # Label correlated events with attack information
+        if len(redteam_df) > 0:
+            correlated_events = self._label_correlated_events(correlated_events, redteam_df, correlation_window_sec)
+
+        logger.info(f"✅ Created {len(correlated_events)} correlated events")
+
+        # Add correlation quality analysis
+        quality_report = self.analyze_correlation_quality(correlated_events)
+
+        return correlated_events, quality_report
+
+    def _find_related_processes(self, proc_df: pd.DataFrame, auth_user: str,
+                              auth_computer_clean: str, window_start: pd.Timestamp,
+                              window_end: pd.Timestamp) -> pd.DataFrame:
+        """Find processes related to auth event with robust matching"""
+        if len(proc_df) == 0:
+            return pd.DataFrame()
+
+        time_window = (proc_df['timestamp'] >= window_start) & \
+                     (proc_df['timestamp'] <= window_end)
+
+        # Try multiple matching strategies for robustness
+
+        # Strategy 1: Exact user_id match (most reliable)
+        try:
+            exact_user_matches = proc_df['user_id'] == auth_user
+            exact_user_proc = proc_df[exact_user_matches & time_window]
+
+            if len(exact_user_proc) > 0:
+                logger.debug(f"   Found {len(exact_user_proc)} processes via exact user match")
+                return exact_user_proc
+        except Exception as e:
+            logger.debug(f"Exact user match failed: {e}")
+
+        # Strategy 2: Computer match (if user doesn't match)
+        if auth_computer_clean:
+            try:
+                # Try exact computer match first
+                exact_computer_matches = proc_df['computer'] == auth_computer_clean
+                exact_computer_proc = proc_df[exact_computer_matches & time_window]
+
+                if len(exact_computer_proc) > 0:
+                    return exact_computer_proc
+
+                # Try partial computer match (e.g., C586 matches C586 in C586.domain)
+                # Escape special regex characters in the computer ID
+                import re
+                escaped_computer = re.escape(auth_computer_clean)
+                partial_computer_matches = proc_df['computer'].str.contains(escaped_computer, na=False, regex=True)
+                partial_computer_proc = proc_df[partial_computer_matches & time_window]
+
+                if len(partial_computer_proc) > 0:
+                    return partial_computer_proc
+            except Exception as e:
+                logger.debug(f"Computer match failed for '{auth_computer_clean}': {e}")
+
+        # Strategy 3: Domain-based matching
+        if auth_user and '@' in auth_user:
+            # Extract domain from auth user
+            auth_domain = auth_user.split('@')[-1]
+            if auth_domain and len(auth_domain) > 2:
+                try:
+                    # Look for processes in same domain - escape special regex characters
+                    import re
+                    escaped_domain = re.escape(auth_domain)
+                    domain_matches = proc_df['user_id'].str.contains(escaped_domain, na=False, regex=True)
+                    domain_proc = proc_df[domain_matches & time_window]
+
+                    if len(domain_proc) > 0:
+                        logger.debug(f"   Found {len(domain_proc)} processes via domain matching")
+                        return domain_proc
+                except Exception as e:
+                    logger.debug(f"Domain matching failed for '{auth_domain}': {e}")
+
+        # Strategy 4: Fuzzy user matching (last resort)
+        fuzzy_user_proc = pd.DataFrame()
+
+        if auth_user:
+            # Extract base username (remove domain/computer parts)
+            base_user = str(auth_user).split('@')[0].split('\\')[-1].split('$')[0]
+            if len(base_user) > 2:  # Only for meaningful usernames
+                try:
+                    # Try to match user patterns - be extra safe with regex
+                    import re
+                    escaped_base_user = re.escape(base_user)
+                    fuzzy_user = (proc_df['user_id'].str.contains(escaped_base_user, na=False, regex=True) &
+                                 proc_df['user_id'].str.contains('@DOM1', na=False, regex=True))  # Common domain
+                    fuzzy_user_proc = proc_df[fuzzy_user & time_window]
+                except Exception as e:
+                    logger.debug(f"Fuzzy matching failed for base_user '{base_user}': {e}")
+                    fuzzy_user_proc = pd.DataFrame()
+
+        if len(fuzzy_user_proc) > 0:
+            logger.info(f"   Found {len(fuzzy_user_proc)} processes via fuzzy matching")
+            return fuzzy_user_proc
+
+        # Strategy 5: No match found - but log for debugging
+        logger.debug(f"   No process matches found for auth_user={auth_user}, computer={auth_computer_clean}")
+        return pd.DataFrame()
+
+    def _find_related_flows(self, flows_df: pd.DataFrame, auth_computer_clean: str,
+                          window_start: pd.Timestamp, window_end: pd.Timestamp) -> pd.DataFrame:
+        """Find network flows related to auth event"""
+        if len(flows_df) == 0 or not auth_computer_clean:
+            return pd.DataFrame()
+
+        time_window = (flows_df['timestamp'] >= window_start) & \
+                     (flows_df['timestamp'] <= window_end)
+
+        # Match flows where computer is either source or destination
+        if auth_computer_clean:  # Only search if we have a valid computer ID
+            try:
+                import re
+                escaped_computer = re.escape(auth_computer_clean)
+                src_flows = flows_df['src_computer'].str.contains(escaped_computer, na=False, regex=True)
+                dst_flows = flows_df['dst_computer'].str.contains(escaped_computer, na=False, regex=True)
+                related_flows = flows_df[(src_flows | dst_flows) & time_window]
+            except Exception as e:
+                logger.debug(f"Flows matching failed for '{auth_computer_clean}': {e}")
+                related_flows = pd.DataFrame()
+        else:
+            related_flows = pd.DataFrame()
+        return related_flows
+
+    def _find_related_dns(self, dns_df: pd.DataFrame, auth_computer_clean: str,
+                         window_start: pd.Timestamp, window_end: pd.Timestamp) -> pd.DataFrame:
+        """Find DNS queries related to auth event"""
+        if len(dns_df) == 0 or not auth_computer_clean:
+            return pd.DataFrame()
+
+        time_window = (dns_df['timestamp'] >= window_start) & \
+                     (dns_df['timestamp'] <= window_end)
+
+        # Match DNS queries from the computer
+        if auth_computer_clean:  # Only search if we have a valid computer ID
+            try:
+                import re
+                escaped_computer = re.escape(auth_computer_clean)
+                dns_queries = dns_df['src_computer'].str.contains(escaped_computer, na=False, regex=True)
+                related_dns = dns_df[dns_queries & time_window]
+            except Exception as e:
+                logger.debug(f"DNS matching failed for '{auth_computer_clean}': {e}")
+                related_dns = pd.DataFrame()
+        else:
+            related_dns = pd.DataFrame()
+        return related_dns
+
+    def _label_correlated_events(self, correlated_events: List[dict], redteam_df: pd.DataFrame,
+                               correlation_window_sec: int) -> List[dict]:
+        """Label correlated events based on attack proximity"""
+        window = pd.Timedelta(seconds=correlation_window_sec)
+
+        for event in correlated_events:
+            timestamp = event['timestamp']
+            auth_user = event['auth_event']['user_id']
+
+            # Find nearby attacks for the same user (handle different ID formats)
+            # Try direct match first
+            user_attacks = redteam_df[redteam_df['user_id'] == auth_user]
+
+            # If no direct match, try partial match
+            if len(user_attacks) == 0:
+                user_attacks = redteam_df[redteam_df['user_id'].str.contains(str(auth_user).split('@')[0], na=False)]
+
+            for _, attack in user_attacks.iterrows():
+                attack_time = attack['timestamp']
+                if abs((attack_time - timestamp).total_seconds()) <= correlation_window_sec:
+                    event['is_malicious'] = True
+                    event['attack_time'] = attack_time
+                    break
+
+        n_malicious = sum(1 for e in correlated_events if e['is_malicious'])
+        logger.info(f"📋 Labeled: {n_malicious} malicious, {len(correlated_events) - n_malicious} benign")
+        return correlated_events
 
     def validate_data(self) -> dict:
         """Validate loaded data quality"""

@@ -21,6 +21,7 @@ from src.data.lanl_loader import LANLLoader
 from src.data.session_builder import SessionBuilder, SessionConfig
 from src.evaluation.context_analysis import ContextWindowAnalyzer
 from src.models.ngram_models import NgramLanguageModel, evaluate_ngram_model
+from src.features.semantic_features import extract_semantic_features_batch, SemanticFeatureExtractor
 from src.utils.reproducibility import set_seed
 import gc
 import psutil
@@ -162,6 +163,147 @@ def categorize_single_fp(session, model_type):
     return 'model_limitation'
 
 
+def test_simple_baselines(all_sessions):
+    """
+    Test simple baselines using only features (no sequences)
+    This helps determine if SAG complexity is justified
+    """
+    logger.info("🧪 Testing simple baselines with features only...")
+
+    # Extract features and labels
+    X = []
+    y = []
+
+    for session in all_sessions:
+        features = get_session_features(session)
+        feature_vector = [
+            features.get('n_events', 0),
+            features.get('duration', 0),
+            1 if features.get('is_admin', False) else 0,
+            features.get('hour', 0),
+            1 if features.get('is_business_hours', False) else 0,
+            1 if features.get('is_unusual_time', False) else 0,
+            features.get('unique_users', 0),
+            features.get('auth_type_diversity', 0),
+            1 if features.get('has_critical_auth', False) else 0,
+            1 if features.get('cross_host_activity', False) else 0
+        ]
+        X.append(feature_vector)
+        y.append(1 if session.get('is_malicious', False) else 0)
+
+    X = np.array(X)
+    y = np.array(y)
+
+    if len(X) == 0 or len(np.unique(y)) < 2:
+        logger.error("❌ Not enough data for baseline testing")
+        return {}
+
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, stratify=y, random_state=42
+    )
+
+    results = {}
+
+    # Baseline 1: LightGBM (tree-based)
+    try:
+        import lightgbm as lgb
+        lgb_model = lgb.LGBMClassifier(
+            n_estimators=100,
+            max_depth=5,
+            random_state=42,
+            verbose=-1
+        )
+        lgb_model.fit(X_train, y_train)
+        lgb_pred_proba = lgb_model.predict_proba(X_test)[:, 1]
+        lgb_auc = roc_auc_score(y_test, lgb_pred_proba)
+        results['lightgbm'] = {
+            'auc': lgb_auc,
+            'model': lgb_model
+        }
+        logger.info(f"   LightGBM AUC: {lgb_auc:.3f}")
+    except ImportError:
+        logger.warning("   ⚠️ LightGBM not available - skipping")
+        results['lightgbm'] = {'auc': 0.5}
+
+    # Baseline 2: Random Forest
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+        rf_model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=5,
+            random_state=42
+        )
+        rf_model.fit(X_train, y_train)
+        rf_pred_proba = rf_model.predict_proba(X_test)[:, 1]
+        rf_auc = roc_auc_score(y_test, rf_pred_proba)
+        results['random_forest'] = {
+            'auc': rf_auc,
+            'model': rf_model
+        }
+        logger.info(f"   Random Forest AUC: {rf_auc:.3f}")
+    except:
+        logger.warning("   ⚠️ Random Forest failed - skipping")
+        results['random_forest'] = {'auc': 0.5}
+
+    # Baseline 3: Logistic Regression
+    try:
+        from sklearn.linear_model import LogisticRegression
+        lr_model = LogisticRegression(random_state=42, max_iter=1000)
+        lr_model.fit(X_train, y_train)
+        lr_pred_proba = lr_model.predict_proba(X_test)[:, 1]
+        lr_auc = roc_auc_score(y_test, lr_pred_proba)
+        results['logistic_regression'] = {
+            'auc': lr_auc,
+            'model': lr_model
+        }
+        logger.info(f"   Logistic Regression AUC: {lr_auc:.3f}")
+    except:
+        logger.warning("   ⚠️ Logistic Regression failed - skipping")
+        results['logistic_regression'] = {'auc': 0.5}
+
+    # Baseline 4: Rule-based (simple heuristics)
+    rule_predictions = []
+    for features in X_test:
+        # Simple rule: flag if unusual time + critical auth + not admin
+        unusual_time = features[5]  # is_unusual_time
+        critical_auth = features[8]  # has_critical_auth
+        is_admin = features[2]      # is_admin
+
+        rule_score = 0.0
+        if unusual_time and critical_auth and not is_admin:
+            rule_score = 0.8  # High suspicion
+        elif unusual_time and critical_auth:
+            rule_score = 0.4  # Medium suspicion
+
+        rule_predictions.append(rule_score)
+
+    rule_auc = roc_auc_score(y_test, rule_predictions)
+    results['rule_based'] = {
+        'auc': rule_auc,
+        'predictions': rule_predictions
+    }
+    logger.info(f"   Rule-based AUC: {rule_auc:.3f}")
+
+    # Analyze results
+    baseline_aucs = [r.get('auc', 0.5) for r in results.values() if 'auc' in r]
+    best_baseline_auc = max(baseline_aucs) if baseline_aucs else 0.5
+
+    logger.info(f"📊 Best baseline AUC: {best_baseline_auc:.3f}")
+
+    if best_baseline_auc > 0.85:
+        logger.warning("⚠️ Simple baselines achieve high performance")
+        logger.warning("   SAG may not be necessary - consider simpler approaches")
+    elif best_baseline_auc > 0.75:
+        logger.info("✅ Baselines show moderate performance")
+        logger.info("   SAG might provide incremental improvement")
+    else:
+        logger.info("✅ Baselines show poor performance")
+        logger.info("   SAG could provide significant improvement")
+
+    return results
+
+
 def test_feature_informativeness(all_sessions):
     """
     Test if features capture semantics (CRITICAL from co-advisor feedback)
@@ -232,9 +374,10 @@ def estimate_sag_computational_cost(n_sessions, avg_seq_length):
     L = avg_seq_length
     T = 100  # Trees in LightGBM
     F = 50   # Number of features
+    N = 3    # ✅ FIX: Changed from n=5 to n=3 for n-gram model
 
     # TreeSHAP distillation cost
-    operations_per_session = L * L * T * F
+    operations_per_session = L * L * T * F * N
     total_operations = operations_per_session * n_sessions
 
     # Rough estimates (very approximate)
@@ -285,18 +428,43 @@ def analyze_semantic_gap_with_tests(fp_categories, total_fps, total_benign, feat
     logger.info(f"  Model Limitation FPs: {len(fp_categories['model_limitation'])}")
     logger.info(f"  Possible Mislabels: {len(fp_categories['possible_mislabel'])}")
 
-    # Decision logic
-    should_proceed_sag = semantic_gap_ratio > 0.5  # >50% of FPs are semantic
+    # Decision logic (ENHANCED with baselines)
+    # Extract best baseline AUC
+    baseline_aucs = [r.get('auc', 0.5) for r in baseline_results.values() if 'auc' in r]
+    best_baseline_auc = max(baseline_aucs) if baseline_aucs else 0.5
+
+    should_proceed_sag = (
+        semantic_gap_ratio > 0.5 and  # >50% of FPs are semantic
+        features_informative and      # Features are informative enough
+        computationally_feasible and   # SAG is computationally feasible
+        best_baseline_auc < 0.85     # SAG justified only if baselines are not excellent
+    )
     overall_fp_rate = total_fps / total_benign if total_benign > 0 else 0
 
     recommendations = []
 
     if should_proceed_sag:
-        recommendations.append("✅ SAG is justified - semantic gap is significant")
+        recommendations.append("✅ SAG is justified - all tests passed!")
         recommendations.append(f"   {semantic_gap_ratio*100:.1f}% of false positives are semantically benign")
+        recommendations.append(f"   Feature AUC: {feature_auc:.3f}")
+        recommendations.append(f"   Best baseline AUC: {best_baseline_auc:.3f}")
+        recommendations.append("   Computationally feasible")
     else:
-        recommendations.append("⚠️ SAG may not be justified")
-        recommendations.append(f"   Only {semantic_gap_ratio*100:.1f}% of FPs are semantic gap")
+        recommendations.append("⚠️ SAG may not be justified - one or more tests failed")
+
+        if semantic_gap_ratio <= 0.5:
+            recommendations.append(f"   Only {semantic_gap_ratio*100:.1f}% of FPs are semantic gap")
+
+        if not features_informative:
+            recommendations.append(f"   Features not informative: AUC {feature_auc:.3f}")
+
+        if best_baseline_auc >= 0.85:
+            recommendations.append(f"   Excellent baseline performance: AUC {best_baseline_auc:.3f}")
+            recommendations.append("   SAG may not provide significant improvement")
+
+        if not computationally_feasible:
+            recommendations.append("   Computationally infeasible for SAG")
+
         recommendations.append("   Consider simpler approaches first:")
         recommendations.append("   - Improve feature engineering")
         recommendations.append("   - Try context-aware n-grams")
@@ -330,112 +498,123 @@ def run_actual_semantic_gap_analysis():
     if not check_memory_or_abort("semantic_gap_analysis", min_gb=3.0):
         return 1
 
-    # Load data (conservative for analysis)
-    logger.info("📂 Loading data for analysis...")
+    # Load data using new multi-source loader
+    logger.info("📂 Loading data for analysis with multi-source correlation...")
     loader = LANLLoader(Path("data/raw/lanl"))
 
-    # Quick check for attack days
-    redteam_file = Path("data/raw/lanl/redteam.txt")
-    if not redteam_file.exists():
-        logger.error("❌ No red team labels!")
+    # Check if all required files exist
+    required_files = ['auth.txt', 'proc.txt', 'flows.txt', 'dns.txt', 'redteam.txt']
+    missing_files = [f for f in required_files if not (Path("data/raw/lanl") / f).exists()]
+    if missing_files:
+        logger.error(f"❌ Missing required files: {missing_files}")
         return 1
 
-    redteam_quick = pd.read_csv(redteam_file, header=None,
-                               names=['time', 'user', 'src_computer', 'dst_computer'])
-    redteam_quick['day'] = (redteam_quick['time'] / 86400).astype(int) + 1
-    attack_days = sorted(redteam_quick['day'].unique())
+    # Load attack days for targeting
+    redteam_df = loader._load_redteam_data()
+    if len(redteam_df) == 0:
+        logger.error("❌ No red team data found")
+        return 1
+
+    attack_days = sorted(redteam_df['day'].unique())
     logger.info(f"📅 Attack days: {attack_days}")
 
-    # Load minimal data for analysis (1-2 attack days + buffer)
+    # Load minimal data for analysis (1-2 attack days + buffer, LANL starts on day 91)
     days_to_load = list(range(
-        attack_days[0] - 1,
+        max(91, attack_days[0] - 1),  # Don't go before day 91
         min(attack_days[0] + 3, attack_days[0] + 5)  # Max 5 days for analysis
     ))
     logger.info(f"📊 Loading {len(days_to_load)} days for analysis")
 
-    auth_df, redteam_df = loader.load_sample(days=days_to_load)
-
-    # Normalize column names
-    if 'user' in redteam_df.columns and 'user_id' not in redteam_df.columns:
-        redteam_df['user_id'] = redteam_df['user']
-
-    # Clean up redteam_quick
-    aggressive_cleanup(redteam_quick)
-    log_memory_usage("After data load")
-
-    # Limit for analysis
-    MAX_EVENTS = 500_000  # Conservative for analysis
-    if len(auth_df) > MAX_EVENTS:
-        logger.warning(f"⚠️ Downsampling for analysis: {len(auth_df):,} → {MAX_EVENTS:,}")
-        auth_df = auth_df.sample(n=MAX_EVENTS, random_state=42)
-
-    # Build sessions
-    logger.info("🔧 Building sessions for analysis...")
-    config = SessionConfig(
-        timeout_minutes=30,
-        min_events=3,
-        max_events=100,
-        labeling="window",
-        label_window_minutes=240
+    # Load correlated events using new multi-source approach
+    logger.info("🔗 Loading and correlating multiple data sources...")
+    correlated_events, quality_report = loader.load_full_context(
+        days=days_to_load,
+        max_rows=200_000,  # Conservative for analysis
+        correlation_window_sec=300  # 5 minute correlation window
     )
-    builder = SessionBuilder(config)
-    all_sessions = builder.build_sessions(auth_df, redteam_df, train_mode=False)
 
-    # Clean up dataframes
-    aggressive_cleanup(auth_df, redteam_df)
-    log_memory_usage("After session building")
+    # Check correlation quality (CRITICAL from peer review)
+    logger.info(f"📊 Correlation quality: {quality_report['correlation_rate']*100:.1f}% events have context")
+    if quality_report['status'] == 'poor':
+        logger.error("❌ CORRELATION QUALITY IS POOR - This is a critical blocker!")
+        logger.error("   Fix correlation before proceeding with SAG")
+        return 1
 
-    # Filter sessions
-    benign = [s for s in all_sessions if not s['is_malicious']]
-    malicious = [s for s in all_sessions if s['is_malicious']]
+    log_memory_usage("After multi-source data loading")
+
+    # Filter to events with related processes (for semantic analysis)
+    logger.info("🔍 Filtering to events with semantic context...")
+    events_with_processes = [
+        event for event in correlated_events
+        if len(event.get('related_processes', [])) > 0
+    ]
+
+    logger.info(f"📊 Events with process context: {len(events_with_processes)}/{len(correlated_events)}")
+
+    # Validate we have enough events for analysis
+    if len(events_with_processes) < 100:
+        logger.error(f"❌ Not enough events with process context: {len(events_with_processes)} < 100")
+        logger.error("   This suggests correlation is failing")
+        return 1
+
+    if len(events_with_processes) == 0:
+        logger.error("❌ No events with process context for semantic analysis")
+        return 1
+
+    # Split into benign and malicious
+    benign_events = [e for e in events_with_processes if not e['is_malicious']]
+    malicious_events = [e for e in events_with_processes if e['is_malicious']]
 
     logger.info(f"📊 Dataset for analysis:")
-    logger.info(f"  Benign: {len(benign)}")
-    logger.info(f"  Malicious: {len(malicious)}")
+    logger.info(f"  Benign: {len(benign_events)}")
+    logger.info(f"  Malicious: {len(malicious_events)}")
 
-    if len(malicious) < 10:
+    if len(malicious_events) < 10:
         logger.error("❌ Need >= 10 malicious samples for analysis")
         return 1
 
     # Sample benign for analysis (keep all malicious)
-    MAX_BENIGN_ANALYSIS = 5000
-    if len(benign) > MAX_BENIGN_ANALYSIS:
+    MAX_BENIGN_ANALYSIS = 3000
+    if len(benign_events) > MAX_BENIGN_ANALYSIS:
         logger.info(f"📊 Sampling {MAX_BENIGN_ANALYSIS} benign for analysis")
         import random
         random.seed(42)
-        benign = random.sample(benign, MAX_BENIGN_ANALYSIS)
+        benign_events = random.sample(benign_events, MAX_BENIGN_ANALYSIS)
 
-    log_memory_usage("After session filtering")
+    log_memory_usage("After benign sampling")
 
     # SPLIT DATA FOR PROPER EVALUATION
     logger.info("🔀 Splitting data for proper evaluation...")
     benign_train, benign_test = train_test_split(
-        benign, test_size=0.3, random_state=42, stratify=[0] * len(benign)
+        benign_events, test_size=0.3, random_state=42
     )
 
     logger.info(f"📊 Split: {len(benign_train)} train, {len(benign_test)} test benign")
-    logger.info(f"📊 Malicious for testing: {len(malicious)}")
+    logger.info(f"📊 Malicious for testing: {len(malicious_events)}")
 
     # PREPARE SEQUENCE DATA FOR N-GRAM MODEL
     logger.info("🔧 Preparing sequence data for n-gram model...")
 
-    def sessions_to_sequences(sessions):
-        """Convert sessions to sequences for n-gram modeling"""
+    def events_to_sequences(events):
+        """Convert correlated events to sequences for n-gram modeling"""
         sequences = []
-        for session in sessions:
-            events = session.get('events', [])
-            # Create simple event representation for n-gram
-            event_sequence = [
-                f"{e.get('auth_type', 'UNK')}_{e.get('outcome', 'UNK')}"
-                for e in events
-            ]
+        for event in events:
+            # Create sequence from auth events
+            auth_event = event.get('auth_event', {})
+            event_sequence = [f"{auth_event.get('auth_type', 'UNK')}_{auth_event.get('outcome', 'UNK')}"]
+
+            # Add process events if available
+            processes = event.get('related_processes', [])
+            for proc in processes:
+                event_sequence.append(f"PROC_{proc.get('process_name', 'UNK')}")
+
             if len(event_sequence) >= 2:  # Need at least 2 events for n-gram
                 sequences.append(event_sequence)
         return sequences
 
-    train_sequences = sessions_to_sequences(benign_train)
-    test_benign_sequences = sessions_to_sequences(benign_test)
-    test_malicious_sequences = sessions_to_sequences(malicious)
+    train_sequences = events_to_sequences(benign_train)
+    test_benign_sequences = events_to_sequences(benign_test)
+    test_malicious_sequences = events_to_sequences(malicious_events)
 
     logger.info(f"📊 Training sequences: {len(train_sequences)}")
     logger.info(f"📊 Test benign sequences: {len(test_benign_sequences)}")
@@ -445,18 +624,33 @@ def run_actual_semantic_gap_analysis():
         logger.error("❌ No valid sequences for analysis")
         return 1
 
-    # TRAIN N-GRAM MODEL
-    logger.info("🧠 Training n-gram model...")
+    # TRAIN N-GRAM MODEL (with vocabulary pruning)
+    logger.info("🧠 Training n-gram model with vocabulary pruning...")
     if not check_memory_or_abort("ngram_training", min_gb=2.0):
         return 1
 
     try:
-        ngram_model = NgramLanguageModel(n=5, smoothing='laplace')
+        # ✅ NEW: Use pruned n-gram model to prevent memory explosion
+        from src.models.ngram_models import PrunedNgramLanguageModel
+        ngram_model = PrunedNgramLanguageModel(
+            n=3,
+            smoothing='laplace',
+            max_vocab_size=50000,  # Limit vocabulary size
+            min_count=2            # Minimum frequency for tokens
+        )
         ngram_model.fit(train_sequences)
-        logger.info("✅ N-gram model trained successfully")
+        logger.info("✅ Pruned n-gram model trained successfully")
+        logger.info(f"   Vocabulary size: {len(ngram_model.pruned_vocab) if ngram_model.pruned_vocab else 'N/A'}")
     except Exception as e:
-        logger.error(f"❌ Failed to train n-gram model: {e}")
-        return 1
+        logger.error(f"❌ Failed to train pruned n-gram model: {e}")
+        logger.info("   Falling back to regular n-gram model...")
+        try:
+            ngram_model = NgramLanguageModel(n=3, smoothing='laplace')
+            ngram_model.fit(train_sequences)
+            logger.info("✅ Regular n-gram model trained successfully")
+        except Exception as e2:
+            logger.error(f"❌ Failed to train n-gram model: {e2}")
+            return 1
 
     log_memory_usage("After ngram training")
 
@@ -552,6 +746,13 @@ def run_actual_semantic_gap_analysis():
     logger.info("="*80)
 
     features_informative, feature_auc = test_feature_informativeness(benign + malicious)
+
+    # TEST 1.5: SIMPLE BASELINE COMPARISONS (NEW)
+    logger.info("\n" + "="*80)
+    logger.info("🧪 TESTING SIMPLE BASELINES (Before SAG)")
+    logger.info("="*80)
+
+    baseline_results = test_simple_baselines(benign + malicious)
 
     # TEST 2: COMPUTATIONAL COST ESTIMATE
     logger.info("\n" + "="*80)

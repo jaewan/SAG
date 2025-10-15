@@ -131,12 +131,251 @@ class SimpleNgramModel:
         return np.exp(-avg_log_prob)
 
 
+class PrunedNgramLanguageModel:
+    """Memory-efficient n-gram model with vocabulary pruning"""
+
+    def __init__(self, n: int = 3, smoothing: str = 'laplace',
+                 max_vocab_size: int = 50000, min_count: int = 2,
+                 oov_handling: str = 'skip'):  # NEW: OOV handling
+        """
+        Initialize pruned n-gram model
+
+        Args:
+            n: N-gram order
+            smoothing: Smoothing method
+            max_vocab_size: Maximum vocabulary size to prevent memory explosion
+            min_count: Minimum frequency for tokens to be included
+            oov_handling: How to handle OOV tokens ('skip', 'unk', 'smooth')
+        """
+        self.max_vocab_size = max_vocab_size
+        self.min_count = min_count
+        self.oov_handling = oov_handling
+
+        # Initialize model attributes similar to parent class
+        self.n = n
+        self.smoothing = smoothing
+        self.model = None
+        self.vocab = None
+        self.is_fitted = False
+
+        # Override model with pruned version
+        if NLTK_AVAILABLE:
+            if smoothing == 'laplace':
+                self.model = Laplace(n)
+            elif smoothing == 'kneser_ney':
+                self.model = KneserNeyInterpolated(n)
+            elif smoothing == 'mle':
+                self.model = MLE(n)
+            else:
+                raise ValueError(f"Unknown smoothing: {smoothing}")
+        else:
+            # Fallback: simple frequency-based model with pruning
+            self.model = SimpleNgramModel(n, smoothing)
+
+        self.vocab = None
+        self.is_fitted = False
+        self.pruned_vocab = None  # Track pruned vocabulary
+        self.oov_token = '<UNK>'  # OOV token for replacement
+
+    def fit(self, sequences: List[List[str]]):
+        """Fit model with vocabulary pruning"""
+        logger.info(f"Training pruned {self.n}-gram model (max_vocab={self.max_vocab_size}, min_count={self.min_count})")
+
+        if NLTK_AVAILABLE:
+            self._fit_nltk_pruned(sequences)
+        else:
+            self._fit_fallback_pruned(sequences)
+
+    def _fit_nltk_pruned(self, sequences: List[List[str]]):
+        """Fit NLTK model with pruning"""
+        from collections import Counter
+
+        # Step 1: Count all tokens across all sequences
+        all_tokens = []
+        for sequence in sequences:
+            all_tokens.extend(sequence)
+
+        token_counts = Counter(all_tokens)
+
+        # Step 2: Prune vocabulary - keep only frequent tokens
+        # Sort by frequency and keep top max_vocab_size above min_count
+        frequent_tokens = [
+            token for token, count in token_counts.most_common()
+            if count >= self.min_count
+        ][:self.max_vocab_size]
+
+        pruned_vocab = set(frequent_tokens)
+        self.pruned_vocab = pruned_vocab
+
+        logger.info(f"✅ Pruned vocabulary: {len(pruned_vocab):,} tokens (from {len(token_counts):,})")
+
+        # Step 3: Filter sequences to only include tokens in pruned vocabulary
+        filtered_sequences = []
+        for sequence in sequences:
+            filtered_seq = [token for token in sequence if token in pruned_vocab]
+            if len(filtered_seq) >= self.n:  # Need at least n tokens for n-gram
+                filtered_sequences.append(filtered_seq)
+
+        logger.info(f"✅ Filtered sequences: {len(filtered_sequences):,}/{len(sequences):,}")
+
+        if len(filtered_sequences) == 0:
+            logger.warning("⚠️ No sequences remain after vocabulary pruning!")
+            self.is_fitted = True  # Mark as fitted but empty
+            return
+
+        # Step 4: Fit model on filtered sequences
+        try:
+            train_data, padded_sents = padded_everygram_pipeline(self.n, filtered_sequences)
+
+            # Create vocabulary from filtered sequences
+            self.vocab = FreqDist()
+            for sent in padded_sents:
+                self.vocab.update(sent)
+
+            # Fit model
+            train_data_list = list(train_data)
+            vocab_list = list(self.vocab)
+
+            self.model.fit(train_data_list, vocab_list)
+            self.is_fitted = True
+
+            logger.info(f"✅ Pruned {self.n}-gram model fitted successfully")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to fit pruned n-gram model: {e}")
+            raise RuntimeError(f"Model fitting failed: {e}") from e
+
+    def perplexity(self, sequences: List[List[str]]) -> float:
+        """Compute perplexity"""
+        if not self.is_fitted or self.model is None:
+            raise RuntimeError("Model not fitted")
+
+        if NLTK_AVAILABLE:
+            # NLTK implementation
+            if len(sequences) == 0:
+                return float('inf')
+
+            total_log_prob = 0.0
+            total_tokens = 0
+
+            for sequence in sequences:
+                if len(sequence) >= self.n:
+                    # Use NLTK's perplexity calculation
+                    try:
+                        seq_log_prob = sum(self.model.logscore(token, context)
+                                         for context, token in zip(
+                                             [tuple(sequence[i-self.n+1:i]) for i in range(self.n-1, len(sequence))],
+                                             sequence[self.n-1:]
+                                         ))
+                        total_log_prob += seq_log_prob
+                        total_tokens += len(sequence) - self.n + 1
+                    except:
+                        # Fallback to simple calculation
+                        total_tokens += len(sequence)
+
+            if total_tokens == 0:
+                return float('inf')
+
+            avg_log_prob = total_log_prob / total_tokens
+            return np.exp(-avg_log_prob)
+        else:
+            # Fallback implementation
+            return self.model.perplexity(sequences)
+
+    def sequence_log_probs(self, sequence: List[str]) -> np.ndarray:
+        """Compute log P(token|context) for each token"""
+        if not self.is_fitted or self.model is None:
+            raise RuntimeError("Model not fitted")
+        if len(sequence) == 0:
+            return np.array([])
+
+        # Apply OOV handling
+        if self.oov_handling == 'unk' and self.pruned_vocab is not None:
+            sequence = [token if token in self.pruned_vocab else self.oov_token for token in sequence]
+        elif self.oov_handling == 'skip' and self.pruned_vocab is not None:
+            sequence = [token for token in sequence if token in self.pruned_vocab]
+
+        if NLTK_AVAILABLE:
+            # NLTK implementation
+            log_probs = []
+            # Manual padding implementation
+            padded = ['<s>'] * (self.n - 1) + sequence + ['</s>']
+            for i in range(self.n - 1, len(padded)):
+                context = tuple(padded[i - self.n + 1:i])
+                token = padded[i]
+                try:
+                    log_prob = self.model.logscore(token, context)
+                    # Handle -inf
+                    if np.isinf(log_prob) and log_prob < 0:
+                        log_prob = -20.0
+                    log_probs.append(log_prob)
+                except:
+                    log_probs.append(-20.0)
+            return np.array(log_probs)
+        else:
+            # Fallback implementation
+            return self.model.sequence_log_probs(sequence)
+
+    def surprise_scores(self, sequence: List[str]) -> np.ndarray:
+        """Compute surprisal = -log P(token|context)"""
+        return -self.sequence_log_probs(sequence)
+
+    def _fit_fallback_pruned(self, sequences: List[List[str]]):
+        """Fit fallback model with pruning"""
+        from collections import Counter
+
+        # Step 1: Count all tokens
+        all_tokens = []
+        for sequence in sequences:
+            all_tokens.extend(sequence)
+
+        token_counts = Counter(all_tokens)
+
+        # Step 2: Prune vocabulary
+        frequent_tokens = [
+            token for token, count in token_counts.most_common()
+            if count >= self.min_count
+        ][:self.max_vocab_size]
+
+        pruned_vocab = set(frequent_tokens)
+        self.pruned_vocab = pruned_vocab
+
+        logger.info(f"✅ Pruned vocabulary: {len(pruned_vocab):,} tokens (from {len(token_counts):,})")
+
+        # Step 3: Filter sequences and fit model
+        filtered_sequences = []
+        for sequence in sequences:
+            filtered_seq = [token for token in sequence if token in pruned_vocab]
+            if len(filtered_seq) >= self.n:
+                filtered_sequences.append(filtered_seq)
+
+        if len(filtered_sequences) == 0:
+            logger.warning("⚠️ No sequences remain after vocabulary pruning!")
+            self.is_fitted = True
+            return
+
+        # Fit the simple model
+        self.model.fit(filtered_sequences)
+        self.is_fitted = True
+
+        logger.info(f"✅ Pruned fallback {self.n}-gram model fitted successfully")
+
+
 class NgramLanguageModel:
     """Production n-gram model using NLTK or fallback"""
 
-    def __init__(self, n: int = 3, smoothing: str = 'laplace'):
+    def __init__(self, n: int = 3, smoothing: str = 'laplace', oov_handling: str = 'skip'):
+        """
+        Initialize n-gram model
+
+        Args:
+            n: N-gram order
+            smoothing: Smoothing method ('laplace', 'kneser_ney', 'mle')
+            oov_handling: How to handle OOV tokens ('skip', 'unk', 'smooth')
+        """
         self.n = n
         self.smoothing = smoothing
+        self.oov_handling = oov_handling
 
         if NLTK_AVAILABLE:
             if smoothing == 'laplace':
@@ -270,6 +509,15 @@ class NgramLanguageModel:
             raise RuntimeError("Model not fitted")
         if len(sequence) == 0:
             return np.array([])
+
+        # Apply OOV handling if vocabulary is available
+        if self.oov_handling != 'smooth' and hasattr(self, 'vocab') and self.vocab is not None:
+            if self.oov_handling == 'unk':
+                # Replace OOV with <UNK> token
+                sequence = [token if token in self.vocab else '<UNK>' for token in sequence]
+            elif self.oov_handling == 'skip':
+                # Skip OOV tokens
+                sequence = [token for token in sequence if token in self.vocab]
 
         if NLTK_AVAILABLE:
             # NLTK implementation

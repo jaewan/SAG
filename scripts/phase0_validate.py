@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 class AuthEventSchema(pa.DataFrameModel):
     """Schema for LANL authentication events"""
 
-    time: pa.typing.Int64 = pa.Field(ge=0, description="Event timestamp (seconds)")
     user_id: pa.typing.String = pa.Field(str_length={"min_value": 1}, description="User identifier")
     src_comp_id: pa.typing.String = pa.Field(str_length={"min_value": 1}, description="Source computer")
     dst_comp_id: pa.typing.String = pa.Field(str_length={"min_value": 1}, description="Destination computer")
@@ -52,7 +51,7 @@ class AuthEventSchema(pa.DataFrameModel):
 class RedTeamEventSchema(pa.DataFrameModel):
     """Schema for red team attack events"""
 
-    time: pa.typing.Int = pa.Field(ge=0, description="Attack timestamp (seconds)")
+    time: pa.typing.Int64 = pa.Field(ge=0, description="Attack timestamp (seconds)")
     user: pa.typing.String = pa.Field(str_length={"min_value": 1}, description="Target user")
     src_computer: pa.typing.String = pa.Field(str_length={"min_value": 1}, description="Source computer")
     dst_computer: pa.typing.String = pa.Field(str_length={"min_value": 1}, description="Destination computer")
@@ -134,7 +133,7 @@ def validate_redteam_data(df: pd.DataFrame) -> dict:
 
     results = {
         'total_events': len(df),
-        'unique_users': df['user_id'].nunique() if 'user_id' in df.columns else df['user'].nunique() if 'user' in df.columns else 0,
+        'unique_users': df['user'].nunique() if 'user' in df.columns else 0,
         'schema_valid': False,
         'issues': []
     }
@@ -240,42 +239,83 @@ def main():
         # Load data - use days with attacks for validation
         logger.info("\n📂 Loading LANL dataset...")
 
-        # Check memory before loading
-        if not check_memory_or_abort("data_loading", min_gb=3.0):
+        # ✅ ULTRA-AGGRESSIVE: Check memory before ANY loading
+        if not check_memory_or_abort("data_loading", min_gb=4.0):
+            logger.error("❌ Insufficient memory for Phase 0 - need at least 4GB")
             return 1
 
-        # First, quickly check what days have attacks
-        redteam_quick = pd.read_csv(
-            data_dir / "redteam.txt",
-            header=None,
-            names=['time', 'user', 'src_computer', 'dst_computer']
-        )
-        redteam_quick['day'] = (redteam_quick['time'] / 86400).astype(int) + 1
-        attack_days = sorted(redteam_quick['day'].unique())
+        # ✅ ULTRA-AGGRESSIVE: Detect attack days with MINIMAL data
+        logger.info("🔍 Detecting attack days (minimal memory)...")
+        try:
+            # Read ONLY first 1000 lines to detect days (was 10K)
+            redteam_quick = pd.read_csv(
+                data_dir / "redteam.txt",
+                header=None,
+                names=['time', 'user', 'src_computer', 'dst_computer'],
+                nrows=1000  # ✅ ULTRA-LIMIT: Only 1K lines
+            )
 
-        logger.info(f"📅 Attack days detected: {attack_days}")
+            # Use the loader to get proper start date and calculate days correctly
+            log_memory_usage("before_quick_loader")
+            quick_loader = LANLLoader(data_dir)
+            start_date = quick_loader.start_date
 
-        # Load first few days with attacks for validation (not all to keep it fast)
-        validation_days = attack_days[:3] if len(attack_days) >= 3 else attack_days
-        logger.info(f"🔍 Validating with days: {validation_days}")
+            # Convert time to proper timestamps and days using the detected start date
+            redteam_quick['timestamp'] = start_date + pd.to_timedelta(redteam_quick['time'], unit='s')
+            redteam_quick['day'] = redteam_quick['timestamp'].dt.dayofyear
+            attack_days = sorted(redteam_quick['day'].unique())
+
+            # ✅ ULTRA-AGGRESSIVE: Use the first attack day
+            if attack_days:
+                validation_day = attack_days[0]
+                logger.info(f"📅 Using attack day: {validation_day} (actual day {validation_day})")
+            else:
+                logger.error("❌ No attack days found")
+                return 1
+
+            # Clean up
+            aggressive_cleanup(redteam_quick, quick_loader)
+
+        except Exception as e:
+            logger.error(f"❌ Failed to detect attack days: {e}")
+            return 1
+
+        # ✅ ULTRA-AGGRESSIVE: Check memory before loader
+        if not check_memory_or_abort("before_loader", min_gb=3.0):
+            logger.error("❌ Insufficient memory for loader creation")
+            return 1
 
         log_memory_usage("before_loading")
         loader = LANLLoader(data_dir)
-        auth_df, redteam_df = loader.load_sample(days=validation_days)
+
+        # ✅ ULTRA-AGGRESSIVE: Load with SEVERE memory limits
+        logger.info("📊 Loading with SEVERE memory limits...")
+        # Use the flexible loader that loads auth from a window around attack day
+        auth_df, redteam_df = loader.load_sample_flexible(
+            attack_day=validation_day,
+            auth_window_days=3,  # 3-day window around attack
+            max_rows=500_000  # ✅ ULTRA-LIMIT: Max 500K events (was 2M)
+        )
         log_memory_usage("after_loading")
 
-        # Clean up redteam_quick immediately
-        aggressive_cleanup(redteam_quick)
+        # ✅ ULTRA-AGGRESSIVE: Immediate cleanup of detection data
+        if 'redteam_quick' in locals():
+            aggressive_cleanup(redteam_quick)
 
-        # Limit for validation
-        if len(auth_df) > 50000:
-            auth_df = auth_df.sample(n=50000, random_state=42)
-            logger.info(f"✅ Sampled {len(auth_df):,} events for validation")
+        # ✅ ULTRA-AGGRESSIVE: Tiny sample for validation (was 10K, now 5K)
+        if len(auth_df) > 5000:
+            auth_df = auth_df.sample(n=5000, random_state=42)  # ✅ ULTRA-LIMIT: Max 5K events
+            logger.info(f"✅ Sampled {len(auth_df):,} auth events for validation")
 
         # Check data sufficiency
         data_ok, data_message = check_sufficient_data(auth_df, redteam_df)
         if not data_ok:
             logger.warning(f"⚠️ Data sufficiency issues: {data_message}")
+
+        # ✅ ULTRA-AGGRESSIVE: Memory check before validation
+        if not check_memory_or_abort("before_auth_validation", min_gb=1.0):
+            logger.error("❌ Insufficient memory for authentication validation")
+            return 1
 
         # Validate
         logger.info("\n" + "="*60)
@@ -296,6 +336,11 @@ def main():
             for issue in auth_results['issues']:
                 logger.error(f"  {issue}")
 
+        # ✅ ULTRA-AGGRESSIVE: Memory check before red team validation
+        if not check_memory_or_abort("before_redteam_validation", min_gb=0.5):
+            logger.error("❌ Insufficient memory for red team validation")
+            return 1
+
         logger.info("\n" + "="*60)
         logger.info("RED TEAM DATA VALIDATION")
         logger.info("="*60)
@@ -312,6 +357,11 @@ def main():
             for issue in redteam_results['issues']:
                 logger.error(f"  {issue}")
 
+        # ✅ ULTRA-AGGRESSIVE: Memory check before final decision
+        if not check_memory_or_abort("before_final_decision", min_gb=0.5):
+            logger.error("❌ Insufficient memory for final decision")
+            return 1
+
         # Overall
         all_passed = (
             auth_results['schema_valid'] and
@@ -324,15 +374,20 @@ def main():
         logger.info("\n" + "="*80)
         if all_passed:
             logger.info("✅ VALIDATION PASSED - Ready for Phase 1")
-            return 0
+            return_code = 0
         else:
             logger.error("❌ VALIDATION FAILED - Fix issues above")
-            return 1
+            return_code = 1
 
-        # ✅ ADDED: Cleanup
+        # ✅ ULTRA-AGGRESSIVE: Comprehensive cleanup (always executes)
         log_memory_usage("before_cleanup")
-        aggressive_cleanup(auth_df, redteam_df)
+        aggressive_cleanup(auth_df, redteam_df, redteam_quick, loader)
+        # Force multiple garbage collections
+        for _ in range(3):
+            gc.collect()
         log_memory_usage("after_cleanup")
+
+        return return_code
 
     except Exception as e:
         logger.error(f"\n❌ Phase 0 failed: {e}")

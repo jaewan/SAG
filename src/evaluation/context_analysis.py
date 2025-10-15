@@ -182,14 +182,23 @@ class ContextWindowAnalyzer:
 
         tokens = []
 
-        # Infer user type (admin/regular/service)
+        # Infer user type (admin/regular/service) - handle both string and int user_ids
         user_id = session['user_id']
-        if user_id < 100:
-            user_type = "admin"
-        elif 10000 <= user_id < 11000:
-            user_type = "service"
+        if isinstance(user_id, str):
+            if "ANONYMOUS LOGON" in user_id:
+                user_type = "service"
+            elif "@" in user_id:
+                user_type = "regular"  # Domain user
+            else:
+                user_type = "regular"  # Local user
         else:
-            user_type = "regular"
+            # Handle integer user_ids (legacy format)
+            if user_id < 100:
+                user_type = "admin"
+            elif 10000 <= user_id < 11000:
+                user_type = "service"
+            else:
+                user_type = "regular"
 
         # Host diversity (single vs multi-host)
         unique_hosts = len(set(e['dst_computer'] for e in session['events']))
