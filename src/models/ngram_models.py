@@ -361,6 +361,39 @@ class PrunedNgramLanguageModel:
         logger.info(f"✅ Pruned fallback {self.n}-gram model fitted successfully")
 
 
+class AdaptivePrunedNgramModel(PrunedNgramLanguageModel):
+    """
+    Automatically prunes to fit memory budget
+    """
+    def __init__(self, n: int, memory_budget_gb: float = 15, **kwargs):
+        self.memory_budget_gb = memory_budget_gb
+
+        # Estimate vocab size from memory budget
+        # Rough estimate: n-gram size ≈ vocab_size^n × 16 bytes
+        estimated_vocab = int((memory_budget_gb * 1e9 / 16) ** (1/n))
+        max_vocab = min(estimated_vocab, 200000)  # Cap at 200K
+
+        logger.info(f"📊 Adaptive pruning for n={n}: max_vocab={max_vocab:,} (budget={memory_budget_gb}GB)")
+
+        super().__init__(n=n, max_vocab_size=max_vocab, **kwargs)
+
+    def fit(self, sequences: List[List[str]]):
+        """Fit with memory monitoring"""
+        import psutil
+        process = psutil.Process()
+        mem_before = process.memory_info().rss / (1024**3)
+
+        super().fit(sequences)
+
+        mem_after = process.memory_info().rss / (1024**3)
+        mem_used = mem_after - mem_before
+
+        logger.info(f"✅ Model memory: {mem_used:.2f}GB / {self.memory_budget_gb}GB budget")
+
+        if mem_used > self.memory_budget_gb * 1.1:
+            logger.warning(f"⚠️ Exceeded memory budget by {(mem_used/self.memory_budget_gb - 1)*100:.1f}%")
+
+
 class NgramLanguageModel:
     """Production n-gram model using NLTK or fallback"""
 

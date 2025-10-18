@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
+from datetime import datetime
 import logging
 import gc  # ✅ ADDED for garbage collection
 import psutil  # ✅ ADDED for memory monitoring
@@ -13,8 +14,96 @@ from sklearn.model_selection import StratifiedKFold, GroupKFold
 from scipy import stats
 import matplotlib.pyplot as plt
 import seaborn as sns
+from joblib import Parallel, delayed  # ✅ ADDED for parallel CV
+from tqdm import tqdm  # ✅ ADDED for progress bars
 
 logger = logging.getLogger(__name__)
+
+
+class TokenizationCache:
+    """
+    Global tokenization cache with LRU eviction for Phase 1 enhancements
+
+    Prevents re-tokenizing the same session multiple times across CV folds
+    """
+    def __init__(self, max_size_gb: float = 5.0):
+        self.cache = {}
+        self.max_size_gb = max_size_gb
+        self.current_size_bytes = 0
+        self.hit_count = 0
+        self.miss_count = 0
+
+        # LRU tracking (simple timestamp-based)
+        self.access_times = {}
+
+    def get(self, session_id: str) -> Optional[List[str]]:
+        """Get cached tokens for session"""
+        if session_id in self.cache:
+            self.hit_count += 1
+            self.access_times[session_id] = datetime.now()
+            return self.cache[session_id]
+        self.miss_count += 1
+        return None
+
+    def put(self, session_id: str, tokens: List[str]):
+        """Cache tokens for session"""
+        # Estimate size (rough approximation)
+        token_size = sum(len(t.encode('utf-8')) for t in tokens) + len(tokens) * 8
+
+        # Check if we need to evict
+        if self.current_size_bytes + token_size > self.max_size_gb * 1e9:
+            self._evict_lru()
+
+        # Still too big? Skip caching
+        if self.current_size_bytes + token_size > self.max_size_gb * 1e9:
+            logger.debug(f"⚠️ Skipping cache for {session_id}: would exceed {self.max_size_gb}GB limit")
+            return
+
+        self.cache[session_id] = tokens
+        self.access_times[session_id] = datetime.now()
+        self.current_size_bytes += token_size
+
+    def stats(self) -> Dict:
+        """Get cache statistics"""
+        total = self.hit_count + self.miss_count
+        hit_rate = self.hit_count / total if total > 0 else 0
+        return {
+            'size_mb': self.current_size_bytes / (1024**2),
+            'entries': len(self.cache),
+            'hit_rate': hit_rate,
+            'hits': self.hit_count,
+            'misses': self.miss_count,
+            'max_size_gb': self.max_size_gb
+        }
+
+    def _evict_lru(self):
+        """Evict least recently used entries"""
+        if not self.access_times:
+            return
+
+        # Find 20% least recently used
+        sorted_times = sorted(self.access_times.items(), key=lambda x: x[1])
+        to_evict = int(len(sorted_times) * 0.2)
+
+        logger.debug(f"🔄 Evicting {to_evict} LRU entries from cache")
+
+        for session_id, _ in sorted_times[:to_evict]:
+            if session_id in self.cache:
+                # Estimate size to subtract
+                tokens = self.cache[session_id]
+                token_size = sum(len(t.encode('utf-8')) for t in tokens) + len(tokens) * 8
+                self.current_size_bytes -= token_size
+                del self.cache[session_id]
+                del self.access_times[session_id]
+
+    def clear(self):
+        """Clear cache"""
+        self.cache.clear()
+        self.access_times.clear()
+        self.current_size_bytes = 0
+        self.hit_count = 0
+        self.miss_count = 0
+        logger.info("🗑️ Tokenization cache cleared")
 
 
 class ContextWindowAnalyzer:
@@ -25,14 +114,23 @@ class ContextWindowAnalyzer:
 
     def __init__(self,
                  n_values: List[int] = None,
-                 cv_folds: int = 5,
-                 min_malicious_per_fold: int = 2,
+                 cv_folds: int = 10,
+                 min_malicious_per_fold: int = 20,
+                 parallel_jobs: int = 8,
+                 memory_per_job_gb: int = 10,
                  cache_tokenization: bool = True):
-        self.n_values = n_values or [1, 2, 3, 5, 10, 25]
+        self.n_values = n_values or [1, 2, 3, 5, 7, 10, 15]
         self.cv_folds = cv_folds
         self.min_malicious_per_fold = min_malicious_per_fold
+        self.parallel_jobs = parallel_jobs
+        self.memory_per_job_gb = memory_per_job_gb
         self.cache_tokenization = cache_tokenization
-        self._token_cache = {}  # ✅ ADDED: Simple tokenization cache
+
+        # Tokenizer will be set by runner
+        self.tokenizer = None
+
+        # ENHANCED: Global tokenization cache for efficiency
+        self.tokenization_cache = TokenizationCache(max_size_gb=5.0) if cache_tokenization else None
 
     def analyze(self,
                 benign_sessions: List[Dict],
@@ -61,9 +159,9 @@ class ContextWindowAnalyzer:
         cv_strategy = self._choose_cv_strategy(benign_sessions, malicious_sessions)
         logger.info(f"\n📊 CV Strategy: {cv_strategy}")
 
-        # Run
+        # Run with progress bars
         results = {}
-        for n in self.n_values:
+        for n in tqdm(self.n_values, desc="N-gram sizes", unit="model"):
             logger.info(f"\n{'='*80}")
             logger.info(f"N={n}-gram Model")
             logger.info(f"{'='*80}")
@@ -93,13 +191,47 @@ class ContextWindowAnalyzer:
         # Plots
         self._plot_results(results)
 
-        # ✅ ADDED: Clear tokenization cache to free memory
-        if self.cache_tokenization:
-            cache_size = len(self._token_cache)
-            self._token_cache.clear()
+        if self.cache_tokenization and self.tokenization_cache is not None:
+            cache_size = len(self.tokenization_cache.cache)
+            self.tokenization_cache.clear()
             logger.info(f"🗑️ Cleared tokenization cache ({cache_size} entries)")
 
         return results, decision
+
+    def _tokenize(self, session: Dict) -> List[str]:
+        """
+        Tokenize session using cached tokenizer
+        """
+        return self._get_tokens(session)
+
+    def _get_tokens(self, session: Dict) -> List[str]:
+        """
+        Get tokens for session, using global cache if enabled
+
+        This prevents re-tokenizing the same session multiple times across CV folds
+        """
+        if not self.tokenizer:
+            raise ValueError("Tokenizer not set")
+
+        session_id = session.get('session_id')
+        if not session_id:
+            # Generate a temporary ID for caching
+            session_id = f"temp_{hash(str(session))}"
+
+        # ENHANCED: Use global tokenization cache
+        if self.tokenization_cache is not None:
+            cached_tokens = self.tokenization_cache.get(session_id)
+            if cached_tokens is not None:
+                logger.debug(f"💾 Cache hit for session {session_id}")
+                return cached_tokens
+            else:
+                # Cache miss - tokenize and cache
+                tokens = self.tokenizer.tokenize_session(session)
+                self.tokenization_cache.put(session_id, tokens)
+                logger.debug(f"💾 Cached tokens for session {session_id}")
+                return tokens
+        else:
+            return self.tokenizer.tokenize_session(session)
 
     def _check_sample_size(self, n_benign: int, n_malicious: int) -> bool:
         """Check sample size"""
@@ -133,6 +265,8 @@ class ContextWindowAnalyzer:
         """
         Choose CV strategy based on data characteristics
         Returns: "stratified", "grouped", or "hybrid"
+
+        PRIORITY: Always prefer Grouped CV to prevent user leakage
         """
         # Count unique malicious users
         mal_users = set(s['user_id'] for s in malicious)
@@ -147,77 +281,20 @@ class ContextWindowAnalyzer:
         logger.info(f" Benign users: {n_ben_users}")
         logger.info(f" Attacks per user: {len(malicious) / n_mal_users:.1f}")
 
-        # Decision logic
-        if n_mal_users < self.cv_folds:
-            # Too few attackers for GroupKFold
-            logger.info(f" → Using STRATIFIED CV (few attackers)")
-            return "stratified"
-        elif n_mal_users >= self.cv_folds * 2:
-            # Enough attackers
-            logger.info(f" → Using GROUPED CV (prevents leakage)")
+        # DECISION LOGIC (prioritize user separation)
+        if n_mal_users >= self.cv_folds:
+            # Enough attackers for proper GroupKFold
+            logger.info(f" → Using GROUPED CV (prevents user leakage)")
+            logger.info(f"   ✅ Each user stays in one fold")
             return "grouped"
         else:
-            # Borderline - try both
-            logger.info(f" → Using HYBRID CV (try both, use best)")
-            return "hybrid"
+            # Too few attackers - use stratified but warn about potential leakage
+            logger.warning(f" → Using STRATIFIED CV (⚠️ potential user leakage)")
+            logger.warning(f"   ⚠️ Same user might appear in train and test")
+            logger.warning(f"   Reason: Only {n_mal_users} attackers for {self.cv_folds} folds")
+            logger.warning(f"   Solution: Load more attack days or reduce folds")
+            return "stratified"
 
-    def _tokenize(self, session: Dict) -> List[str]:
-        """
-        ENHANCED tokenization with user/computer context
-
-        Format: <auth_type>_<outcome>_<user_type>_<host_pattern>
-        Example: "Kerberos_Success_regular_single"
-        """
-        # ✅ ADDED: Simple caching for tokenization
-        if self.cache_tokenization:
-            # Create cache key from session characteristics
-            cache_key = (
-                session['user_id'],
-                len(session['events']),
-                tuple(sorted(set(e['dst_computer'] for e in session['events'])))[:5]  # First 5 hosts
-            )
-
-            if cache_key in self._token_cache:
-                return self._token_cache[cache_key]
-
-        tokens = []
-
-        # Infer user type (admin/regular/service) - handle both string and int user_ids
-        user_id = session['user_id']
-        if isinstance(user_id, str):
-            if "ANONYMOUS LOGON" in user_id:
-                user_type = "service"
-            elif "@" in user_id:
-                user_type = "regular"  # Domain user
-            else:
-                user_type = "regular"  # Local user
-        else:
-            # Handle integer user_ids (legacy format)
-            if user_id < 100:
-                user_type = "admin"
-            elif 10000 <= user_id < 11000:
-                user_type = "service"
-            else:
-                user_type = "regular"
-
-        # Host diversity (single vs multi-host)
-        unique_hosts = len(set(e['dst_computer'] for e in session['events']))
-        if unique_hosts == 1:
-            host_pattern = "single"
-        elif unique_hosts <= 3:
-            host_pattern = "few"
-        else:
-            host_pattern = "many"
-
-        for event in session['events']:
-            token = f"{event['auth_type']}_{event['outcome']}_{user_type}_{host_pattern}"
-            tokens.append(token)
-
-        # ✅ ADDED: Cache the result
-        if self.cache_tokenization:
-            self._token_cache[cache_key] = tokens
-
-        return tokens
 
     def _evaluate_stratified_cv(self, n: int,
                                 benign: List[Dict],
@@ -256,70 +333,127 @@ class ContextWindowAnalyzer:
         return self._evaluate_stratified_cv(n, benign, malicious)
 
     def _run_cv(self, cv, all_sessions, y, n, groups) -> Dict:
-        """Run CV with given splitter"""
-        fold_results = []
-
+        """Run CV with given splitter (now with parallel processing)"""
         if groups is not None:
-            splits = cv.split(all_sessions, y, groups)
+            splits = list(cv.split(all_sessions, y, groups))
         else:
-            splits = cv.split(all_sessions, y)
+            splits = list(cv.split(all_sessions, y))
 
-        for fold_idx, (train_idx, test_idx) in enumerate(splits):
-            logger.info(f"\n Fold {fold_idx+1}/{self.cv_folds}:")
+        logger.info(f"\n🚀 Running {len(splits)} folds in parallel (n_jobs={self.parallel_jobs})")
+        logger.info(f"   Memory allocation: {self.parallel_jobs}×{self.memory_per_job_gb}GB = {self.parallel_jobs * self.memory_per_job_gb}GB")
 
-            # ✅ ADDED: Memory monitoring before each fold
-            try:
-                process = psutil.Process()
-                mem_info = process.memory_info()
-                mem_gb = mem_info.rss / 1024 / 1024 / 1024
-                logger.info(f" 💾 Memory before fold: {mem_gb:.2f} GB")
-            except:
-                pass
+        # ENHANCED: Run folds in parallel with memory monitoring
+        from joblib import parallel_backend
 
-            # Indices of benign in train
-            train_benign_idx = [i for i in train_idx if y[i] == 0]
-            train_sessions = [all_sessions[i] for i in train_benign_idx]
-            test_sessions = [all_sessions[i] for i in test_idx]
-            test_labels = y[test_idx]
-            n_test_mal = (test_labels == 1).sum()
+        with parallel_backend('loky', n_jobs=self.parallel_jobs):
+            fold_results = Parallel()(
+                delayed(self._run_single_fold_with_monitoring)(
+                    fold_idx, train_idx, test_idx, all_sessions, y, n,
+                    memory_limit_gb=self.memory_per_job_gb
+                )
+                for fold_idx, (train_idx, test_idx) in enumerate(splits)
+            )
 
-            logger.info(f" Train: {len(train_sessions)} benign")
-            logger.info(f" Test: {(test_labels==0).sum()} benign, {n_test_mal} malicious")
+        fold_results = [r for r in fold_results if r is not None]
 
-            # Skip fold if no malicious in test
-            if n_test_mal == 0:
-                logger.warning(f" ⚠️ No malicious in test - skipping fold")
-                continue
 
-            # Tokenize (inside loop - no leakage!)
-            train_seqs = [self._tokenize(s) for s in train_sessions]
-            test_seqs = [self._tokenize(s) for s in test_sessions]
-            test_benign_seqs = [seq for seq, label in zip(test_seqs, test_labels) if label == 0]
-            test_mal_seqs = [seq for seq, label in zip(test_seqs, test_labels) if label == 1]
+    def _run_single_fold_with_monitoring(self, fold_idx: int, train_idx: List[int],
+                                        test_idx: List[int], all_sessions: List[Dict],
+                                        y: np.ndarray, n: int,
+                                        memory_limit_gb: float) -> Optional[Dict]:
+        """Run single fold with enhanced memory monitoring"""
+        import psutil
+        process = psutil.Process()
 
-            # Fit
-            try:
-                model = NgramLanguageModel(n=n, smoothing='laplace')
-                model.fit(train_seqs)
-            except Exception as e:
-                logger.error(f" ❌ Fit failed: {e}")
-                # ✅ ADDED: Cleanup on failure
-                del train_seqs, test_seqs
-                gc.collect()
-                continue
+        # Pre-fold memory check
+        mem_start = process.memory_info().rss / (1024**3)
 
-            # Evaluate
-            try:
-                metrics = evaluate_ngram_model(model, test_benign_seqs, test_mal_seqs)
-                fold_results.append(metrics)
-                logger.info(f" AUC: {metrics['auc']:.3f}, TPR@10%: {metrics['tpr_at_10fpr']:.3f}")
-            except Exception as e:
-                logger.warning(f" ⚠️ Eval failed: {e}")
-                # ✅ ADDED: Cleanup on failure
-                del model
-                gc.collect()
-                continue
+        try:
+            # Use existing fold logic with memory limit
+            result = self._run_single_fold(fold_idx, train_idx, test_idx,
+                                          all_sessions, y, n)
 
+            # Post-fold memory check
+            mem_end = process.memory_info().rss / (1024**3)
+            mem_used = mem_end - mem_start
+
+            if mem_used > memory_limit_gb * 1.2:
+                logger.warning(f"⚠️ Fold {fold_idx} exceeded memory budget: {mem_used:.1f}GB > {memory_limit_gb}GB")
+
+            return result
+
+        except MemoryError:
+            logger.error(f"❌ Fold {fold_idx} OOM")
+            return None
+        finally:
+            gc.collect()
+
+    def _run_single_fold(self, fold_idx: int, train_idx: List[int],
+                        test_idx: List[int], all_sessions: List[Dict],
+                        y: np.ndarray, n: int) -> Optional[Dict]:
+        """Run a single CV fold (wrapper for backward compatibility)"""
+        return self._run_single_fold_original(fold_idx, train_idx, test_idx, all_sessions, y, n)
+
+    def _run_single_fold_original(self, fold_idx: int, train_idx: List[int],
+                                test_idx: List[int], all_sessions: List[Dict],
+                                y: np.ndarray, n: int) -> Optional[Dict]:
+        """Run a single CV fold (for parallel processing)"""
+        logger.info(f"\n Fold {fold_idx+1}/{self.cv_folds}:")
+
+        # ✅ ADDED: Memory monitoring before each fold
+        try:
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            mem_gb = mem_info.rss / 1024 / 1024 / 1024
+            logger.info(f" 💾 Memory before fold: {mem_gb:.2f} GB")
+        except:
+            pass
+
+        # Indices of benign in train
+        train_benign_idx = [i for i in train_idx if y[i] == 0]
+        train_sessions = [all_sessions[i] for i in train_benign_idx]
+        test_sessions = [all_sessions[i] for i in test_idx]
+        test_labels = y[test_idx]
+        n_test_mal = (test_labels == 1).sum()
+
+        logger.info(f" Train: {len(train_sessions)} benign")
+        logger.info(f" Test: {(test_labels==0).sum()} benign, {n_test_mal} malicious")
+
+        # Skip fold if no malicious in test
+        if n_test_mal == 0:
+            logger.warning(f" ⚠️ No malicious in test - skipping fold")
+            return None
+
+        # Tokenize (inside loop - no leakage!)
+        train_seqs = [self._tokenize(s) for s in train_sessions]
+        test_seqs = [self._tokenize(s) for s in test_sessions]
+        test_benign_seqs = [seq for seq, label in zip(test_seqs, test_labels) if label == 0]
+        test_mal_seqs = [seq for seq, label in zip(test_seqs, test_labels) if label == 1]
+
+        # Fit
+        try:
+            model = NgramLanguageModel(n=n, smoothing='laplace')
+            model.fit(train_seqs)
+        except Exception as e:
+            logger.error(f" ❌ Fit failed: {e}")
+            # ✅ ADDED: Cleanup on failure
+            del train_seqs, test_seqs
+            gc.collect()
+            return None
+
+        # Evaluate
+        try:
+            metrics = evaluate_ngram_model(model, test_benign_seqs, test_mal_seqs)
+            logger.info(f" AUC: {metrics['auc']:.3f}, TPR@10%: {metrics['tpr_at_10fpr']:.3f}")
+            return metrics
+        except Exception as e:
+            logger.warning(f" ⚠️ Eval failed: {e}")
+            # ✅ ADDED: Cleanup on failure
+            del model
+            gc.collect()
+            return None
+
+        finally:
             # ✅ ADDED: Aggressive cleanup after each fold
             del train_sessions, test_sessions, train_seqs, test_seqs, test_benign_seqs, test_mal_seqs
             if 'model' in locals():
@@ -335,25 +469,6 @@ class ContextWindowAnalyzer:
             except:
                 pass
 
-        if len(fold_results) == 0:
-            raise RuntimeError(f"All {self.cv_folds} folds failed for n={n}")
-
-        if len(fold_results) < self.cv_folds * 0.5:
-            logger.warning(f" ⚠️ Only {len(fold_results)}/{self.cv_folds} folds succeeded")
-
-        # Aggregate
-        df = pd.DataFrame(fold_results)
-        return {
-            'auc_mean': df['auc'].mean(),
-            'auc_std': df['auc'].std(),
-            'auc_sem': df['auc'].sem(),
-            'auc_ci': stats.t.interval(0.95, len(df)-1, df['auc'].mean(), df['auc'].sem()) if len(df) > 1 else (0, 1),
-            'tpr_mean': df['tpr_at_10fpr'].mean(),
-            'tpr_std': df['tpr_at_10fpr'].std(),
-            'ppl_ratio_mean': df['perplexity_ratio'].mean(),
-            'fold_results': fold_results,
-            'n_folds': len(fold_results)
-        }
 
     def _check_statistical_power(self, n_samples: int, effect_size: float = 0.05) -> float:
         """
@@ -485,6 +600,128 @@ class ContextWindowAnalyzer:
         plt.savefig(output, dpi=300, bbox_inches='tight')
         logger.info(f"\n📊 Saved: {output}")
         plt.close()
+
+
+class CorrelatedContextWindowAnalyzer(ContextWindowAnalyzer):
+    """ContextWindowAnalyzer that uses correlated data for richer tokenization"""
+
+    def __init__(self, *args, model_class=None, model_kwargs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_class = model_class
+        self.model_kwargs = model_kwargs or {}
+
+        # Use semantic tokenizer
+        from src.features.semantic_tokenizer import LANLSemanticTokenizer
+        self.semantic_tokenizer = LANLSemanticTokenizer()
+        logger.info("✅ Using semantic tokenizer")
+
+    def _get_tokens(self, session: Dict) -> List[str]:
+        """Use semantic tokenizer instead of computer IDs"""
+        return self.semantic_tokenizer.tokenize_session(session)
+
+    def _run_cv(self, cv, all_sessions, y, n, groups):
+        """Override to use custom model class with parallel processing"""
+        if groups is not None:
+            splits = list(cv.split(all_sessions, y, groups))
+        else:
+            splits = list(cv.split(all_sessions, y))
+
+        logger.info(f"\n🚀 Running {len(splits)} folds in parallel (n_jobs=min(4, {self.cv_folds}))")
+
+        # Run folds in parallel (2-4x speedup)
+        fold_results = Parallel(n_jobs=min(4, self.cv_folds))(
+            delayed(self._run_single_fold)(
+                fold_idx, train_idx, test_idx, all_sessions, y, n
+            )
+            for fold_idx, (train_idx, test_idx) in enumerate(splits)
+        )
+
+        fold_results = [r for r in fold_results if r is not None]
+
+        if len(fold_results) == 0:
+            raise RuntimeError(f"All {self.cv_folds} folds failed for n={n}")
+
+        if len(fold_results) < self.cv_folds * 0.5:
+            logger.warning(f" ⚠️ Only {len(fold_results)}/{self.cv_folds} folds succeeded")
+
+        # Aggregate
+        df = pd.DataFrame(fold_results)
+        return {
+            'auc_mean': df['auc'].mean(),
+            'auc_std': df['auc'].std(),
+            'auc_sem': df['auc'].sem(),
+            'auc_ci': stats.t.interval(0.95, len(df)-1, df['auc'].mean(), df['auc'].sem()) if len(df) > 1 else (0, 1),
+            'tpr_mean': df['tpr_at_10fpr'].mean(),
+            'tpr_std': df['tpr_at_10fpr'].std(),
+            'ppl_ratio_mean': df['perplexity_ratio'].mean(),
+            'fold_results': fold_results,
+            'n_folds': len(fold_results)
+        }
+
+    def _run_single_fold(self, fold_idx: int, train_idx: List[int],
+                        test_idx: List[int], all_sessions: List[Dict],
+                        y: np.ndarray, n: int) -> Optional[Dict]:
+        """Run a single CV fold (for parallel processing)"""
+        logger.info(f"\n Fold {fold_idx+1}/{self.cv_folds}:")
+
+        # Memory monitoring before each fold
+        try:
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            mem_gb = mem_info.rss / 1024 / 1024 / 1024
+            logger.info(f" 💾 Memory before fold: {mem_gb:.2f} GB")
+        except:
+            pass
+
+        # Get train/test data
+        train_benign_idx = [i for i in train_idx if y[i] == 0]
+        train_sessions = [all_sessions[i] for i in train_benign_idx]
+        test_sessions = [all_sessions[i] for i in test_idx]
+        test_labels = y[test_idx]
+        n_test_mal = (test_labels == 1).sum()
+
+        logger.info(f" Train: {len(train_sessions)} benign")
+        logger.info(f" Test: {(test_labels==0).sum()} benign, {n_test_mal} malicious")
+
+        # Skip fold if no malicious in test
+        if n_test_mal == 0:
+            logger.warning(f" ⚠️ No malicious in test - skipping fold")
+            return None
+
+        # Tokenize
+        train_seqs = [self._tokenize(s) for s in train_sessions]
+        test_seqs = [self._tokenize(s) for s in test_sessions]
+        test_benign_seqs = [seq for seq, label in zip(test_seqs, test_labels) if label == 0]
+        test_mal_seqs = [seq for seq, label in zip(test_seqs, test_labels) if label == 1]
+
+        # Fit model with custom class and parameters
+        model = None
+        try:
+            model = self.model_class(n=n, **self.model_kwargs)
+            model.fit(train_seqs)
+        except Exception as e:
+            logger.error(f" ❌ Fit failed: {e}")
+            del train_seqs, test_seqs
+            gc.collect()
+            return None
+
+        # Evaluate
+        try:
+            metrics = evaluate_ngram_model(model, test_benign_seqs, test_mal_seqs)
+            logger.info(f" AUC: {metrics['auc']:.3f}, TPR@10%: {metrics['tpr_at_10fpr']:.3f}")
+        except Exception as e:
+            logger.warning(f" ⚠️ Eval failed: {e}")
+            del model
+            gc.collect()
+            return None
+
+        # Cleanup
+        del train_sessions, test_sessions, train_seqs, test_seqs, test_benign_seqs, test_mal_seqs
+        if model is not None:
+            del model
+        gc.collect()
+
+        return metrics
 
 
 # Import here to avoid circular imports

@@ -1,367 +1,338 @@
 """
-Semantic Feature Extraction for LANL Dataset
-Implements features from the SAG proposal using correlated multi-source data
+Fixed Semantic Features for Phase 1.5
+
+CRITICAL FIX: Handles missing parent_process field in LANL dataset
+Uses temporal sequences and co-occurrence as proxy for process chains
 """
 
+import logging
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any
-from datetime import datetime, timedelta
-import logging
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
-# Critical system paths that should be monitored
-CRITICAL_PATHS = {
-    'windows': [
-        r'C:\Windows\System32',
-        r'C:\Windows\SysWOW64',
-        r'C:\Program Files',
-        r'C:\Program Files (x86)'
-    ],
-    'linux': [
-        '/bin',
-        '/sbin',
-        '/usr/bin',
-        '/usr/sbin',
-        '/etc'
-    ]
-}
 
-# Maintenance windows (example schedule)
-MAINTENANCE_WINDOWS = [
-    # Weekly maintenance: Sunday 2-4 AM
-    {'day': 6, 'start_hour': 2, 'end_hour': 4},
-    # Monthly maintenance: First Sunday of month 1-3 AM
-    {'day': 6, 'start_hour': 1, 'end_hour': 3, 'day_of_month': 1}
-]
+def extract_semantic_features_comprehensive(rare_events: List[Dict]) -> pd.DataFrame:
+    """
+    Extract comprehensive semantic features for rare events
 
-# Suspicious process patterns (threat intelligence based)
-SUSPICIOUS_PATTERNS = {
-    'office_to_shell': [
-        ('winword.exe', 'powershell.exe'),
-        ('excel.exe', 'powershell.exe'),
-        ('outlook.exe', 'powershell.exe'),
-        ('winword.exe', 'cmd.exe'),
-        ('excel.exe', 'cmd.exe')
-    ],
-    'browser_to_shell': [
-        ('chrome.exe', 'powershell.exe'),
-        ('firefox.exe', 'powershell.exe'),
-        ('iexplore.exe', 'powershell.exe')
-    ],
-    'suspicious_processes': [
-        'mimikatz.exe',
-        'psexec.exe',
-        'net.exe',
-        'sc.exe'
-    ]
-}
+    Args:
+        rare_events: List of correlated event dictionaries
 
+    Returns:
+        DataFrame with semantic features
+    """
+    logger.info(f"🎯 Extracting comprehensive semantic features for {len(rare_events)} events...")
 
-class SemanticFeatureExtractor:
-    """Extract semantic features from correlated LANL events"""
+    features = []
 
-    def __init__(self):
-        self.user_history = {}  # Cache for user behavior patterns
-        self.host_graph = {}    # Cache for network topology
+    for event in rare_events:
+        feat = {}
 
-    def extract_features(self, correlated_event: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Extract all semantic features for a correlated event
-
-        Args:
-            correlated_event: Event with auth, processes, flows, and DNS data
-
-        Returns:
-            Dictionary of semantic features
-        """
-        features = {}
-
-        # Entity-State Features
-        features.update(self._extract_entity_state_features(correlated_event))
-
-        # Relational Features
-        features.update(self._extract_relational_features(correlated_event))
-
-        # Temporal Features
-        features.update(self._extract_temporal_features(correlated_event))
-
-        return features
-
-    def _extract_entity_state_features(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract entity-state features (properties of individual entities)"""
-        features = {}
+        # Auth features
         auth_event = event.get('auth_event', {})
+        feat['user_id'] = auth_event.get('user_id', '')
+        feat['src_computer'] = auth_event.get('src_computer', '')
+        feat['dst_computer'] = auth_event.get('dst_computer', '')
+        feat['auth_type'] = auth_event.get('auth_type', '')
+        feat['outcome'] = auth_event.get('outcome', '')
+        feat['timestamp'] = auth_event.get('timestamp')
 
-        # User role features
-        user_id = auth_event.get('user_id', '')
-        features['user_is_admin'] = self._is_admin_user(user_id)
-        features['user_login_frequency'] = self._get_user_login_frequency(user_id)
+        # Semantic user features
+        feat['user_is_admin'] = 'admin' in str(feat['user_id']).lower() or 'system' in str(feat['user_id']).lower()
+        feat['user_is_service'] = '$' in str(feat['user_id']) or 'service' in str(feat['user_id']).lower()
 
-        # Process features
+        # Temporal features
+        if feat['timestamp']:
+            feat['hour'] = feat['timestamp'].hour
+            feat['day_of_week'] = feat['timestamp'].dayofweek
+            feat['is_business_hours'] = 9 <= feat['hour'] <= 17 and feat['day_of_week'] < 5
+            feat['is_unusual_time'] = feat['hour'] < 6 or feat['hour'] > 22
+            feat['is_weekend'] = feat['day_of_week'] >= 5
+        else:
+            feat['hour'] = -1
+            feat['is_business_hours'] = False
+            feat['is_unusual_time'] = False
+
+        # Process features (FIXED - no parent_process in LANL)
         processes = event.get('related_processes', [])
-        if processes:
-            features['process_is_signed'] = self._check_process_signatures(processes)
-            features['has_suspicious_processes'] = self._check_suspicious_processes(processes)
-
-        return features
-
-    def _extract_relational_features(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract relational features (relationships between entities)"""
-        features = {}
-
-        # Process chain features
-        processes = event.get('related_processes', [])
-        if processes:
-            features['parent_child_suspicious'] = self._score_process_chain(processes)
-            features['user_process_legitimate'] = self._check_user_process_authorization(
-                event['auth_event']['user_id'], processes
-            )
+        process_features = extract_process_features_fixed(processes)
+        feat.update(process_features)
 
         # Network features
         flows = event.get('related_flows', [])
-        if flows:
-            features['network_direction'] = self._classify_traffic_direction(flows)
-            features['external_connections'] = self._count_external_connections(flows)
-            features['unusual_network_activity'] = self._detect_unusual_network_activity(flows)
+        network_features = extract_network_features(flows)
+        feat.update(network_features)
 
-        # File access patterns (if available)
-        # Note: LANL doesn't have direct file access logs, but we can infer from processes
+        # DNS features
+        dns_queries = event.get('related_dns', [])
+        dns_features = extract_dns_features(dns_queries)
+        feat.update(dns_features)
 
-        return features
+        # Overall suspicion scores
+        feat['has_process'] = len(processes) > 0
+        feat['has_network'] = len(flows) > 0
+        feat['has_dns'] = len(dns_queries) > 0
 
-    def _extract_temporal_features(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract temporal features (time-based context)"""
-        features = {}
-        timestamp = event.get('timestamp')
+        # Multi-source suspicion score
+        feat['overall_suspicion'] = max(
+            feat.get('process_suspicion', 0),
+            feat.get('network_suspicion', 0),
+            feat.get('dns_suspicion', 0)
+        )
 
-        if timestamp:
-            features['is_business_hours'] = self._is_business_hours(timestamp)
-            features['is_maintenance_window'] = self._is_maintenance_window(timestamp)
-            features['hour_of_day'] = timestamp.hour
-            features['day_of_week'] = timestamp.dayofweek
-            features['is_weekend'] = timestamp.dayofweek >= 5
+        features.append(feat)
 
-        return features
+    df = pd.DataFrame(features)
+    logger.info(f"✅ Extracted {len(df)} events with {len(df.columns)} features")
 
-    def _is_admin_user(self, user_id: str) -> bool:
-        """Check if user has admin privileges"""
-        # Heuristic: admin users typically have 'admin', 'system', or 'administrator' in name
-        admin_indicators = ['admin', 'system', 'administrator', 'root']
-        return any(indicator in user_id.lower() for indicator in admin_indicators)
-
-    def _get_user_login_frequency(self, user_id: str) -> float:
-        """Get user's login frequency (normalized)"""
-        # This would typically be calculated from historical data
-        # For now, return a placeholder based on user type
-        if self._is_admin_user(user_id):
-            return 0.8  # Admins log in more frequently
-        else:
-            return 0.3  # Regular users log in less frequently
-
-    def _check_process_signatures(self, processes: List[Dict]) -> bool:
-        """Check if processes are properly signed"""
-        # Placeholder: In real implementation, would check digital signatures
-        # For now, assume system processes are signed
-        system_processes = {'svchost.exe', 'lsass.exe', 'winlogon.exe', 'explorer.exe'}
-        return any(proc['process_name'].lower() in system_processes
-                  for proc in processes)
-
-    def _check_suspicious_processes(self, processes: List[Dict]) -> bool:
-        """Check for suspicious process names"""
-        for proc in processes:
-            proc_name = proc.get('process_name', '').lower()
-            if any(suspicious in proc_name for suspicious in SUSPICIOUS_PATTERNS['suspicious_processes']):
-                return True
-        return False
-
-    def _score_process_chain(self, processes: List[Dict]) -> float:
-        """Score process parent-child relationships for suspiciousness"""
-        if len(processes) < 2:
-            return 0.0
-
-        # Sort processes by timestamp
-        sorted_processes = sorted(processes, key=lambda p: p['timestamp'])
-
-        suspicious_score = 0.0
-
-        for i in range(len(sorted_processes) - 1):
-            parent = sorted_processes[i]['process_name'].lower()
-            child = sorted_processes[i + 1]['process_name'].lower()
-
-            # Check for suspicious patterns
-            for office_proc, shell_proc in SUSPICIOUS_PATTERNS['office_to_shell']:
-                if office_proc.lower() in parent and shell_proc.lower() in child:
-                    suspicious_score += 0.8  # High suspicion
-
-            for browser_proc, shell_proc in SUSPICIOUS_PATTERNS['browser_to_shell']:
-                if browser_proc.lower() in parent and shell_proc.lower() in child:
-                    suspicious_score += 0.6  # Medium suspicion
-
-        return min(suspicious_score, 1.0)
-
-    def _check_user_process_authorization(self, user_id: str, processes: List[Dict]) -> bool:
-        """Check if user is authorized to run these processes"""
-        if not processes:
-            return True
-
-        # Admin users can run more processes
-        if self._is_admin_user(user_id):
-            return True
-
-        # Regular users should not run system/admin processes
-        system_processes = {'cmd.exe', 'powershell.exe', 'net.exe', 'sc.exe'}
-        for proc in processes:
-            if proc['process_name'].lower() in system_processes:
-                return False
-
-        return True
-
-    def _classify_traffic_direction(self, flows: List[Dict]) -> str:
-        """Classify network traffic as internal or external"""
-        external_indicators = {80, 443, 53}  # Common external ports
-
-        for flow in flows:
-            dst_port = flow.get('dst_port', 0)
-            if dst_port in external_indicators:
-                return 'external'
-
-        return 'internal'
-
-    def _count_external_connections(self, flows: List[Dict]) -> int:
-        """Count number of external connections"""
-        external_indicators = {80, 443, 53, 25, 110, 995, 993}
-        count = 0
-
-        for flow in flows:
-            if flow.get('dst_port') in external_indicators:
-                count += 1
-
-        return count
-
-    def _detect_unusual_network_activity(self, flows: List[Dict]) -> bool:
-        """Detect unusual network patterns"""
-        if not flows:
-            return False
-
-        # Check for unusual protocols or high packet counts
-        for flow in flows:
-            if flow.get('packet_count', 0) > 10000:  # Unusual high packet count
-                return True
-            if flow.get('protocol', 0) not in [6, 17]:  # Not TCP or UDP
-                return True
-
-        return False
-
-    def _is_business_hours(self, timestamp: pd.Timestamp) -> bool:
-        """Check if timestamp is during business hours"""
-        return (9 <= timestamp.hour <= 17) and (timestamp.dayofweek < 5)
-
-    def _is_maintenance_window(self, timestamp: pd.Timestamp) -> bool:
-        """Check if timestamp is during scheduled maintenance"""
-        for window in MAINTENANCE_WINDOWS:
-            if (timestamp.dayofweek == window['day'] and
-                window['start_hour'] <= timestamp.hour < window['end_hour']):
-                return True
-        return False
+    return df
 
 
-def extract_semantic_features_batch(correlated_events: List[Dict[str, Any]]) -> pd.DataFrame:
+def extract_process_features_fixed(processes: List[Dict]) -> Dict:
     """
-    Extract semantic features for a batch of correlated events
+    Extract process features without relying on parent_process field
 
-    Args:
-        correlated_events: List of correlated event dictionaries
-
-    Returns:
-        DataFrame with features for all events
+    LANL proc.txt format: time, user@domain, computer@domain, process_name, start_time
+    NO parent_process field! Must use temporal sequences and co-occurrence.
     """
-    logger.info(f"Extracting semantic features for {len(correlated_events)} events...")
+    if not processes:
+        return {
+            'has_process': False,
+            'process_count': 0,
+            'process_diversity': 0,
+            'process_is_shell': False,
+            'process_is_office': False,
+            'process_is_browser': False,
+            'process_suspicion': 0.0,
+            'suspicious_sequence': 0.0,
+            'suspicious_cooccurrence': 0.0
+        }
 
-    extractor = SemanticFeatureExtractor()
-    features_list = []
-    success_count = 0
-    default_count = 0
+    # Basic process info
+    proc_names = [p.get('process_name', '').lower() for p in processes]
+    unique_procs = set(proc_names)
 
-    for i, event in enumerate(correlated_events):
-        if i % 1000 == 0 and i > 0:
-            logger.info(f"Processed {i:,}/{len(correlated_events):,} events...")
+    features = {
+        'has_process': True,
+        'process_count': len(processes),
+        'process_diversity': len(unique_procs) / len(processes) if processes else 0,
+        'process_is_shell': any('powershell' in p or 'cmd' in p for p in proc_names),
+        'process_is_office': any(o in p for o in ['winword', 'excel', 'outlook'] for p in proc_names),
+        'process_is_browser': any(b in p for b in ['chrome', 'firefox', 'iexplore'] for p in proc_names),
+    }
 
-        try:
-            features = extractor.extract_features(event)
+    # Temporal sequence scoring (FIXED - no parent_process)
+    features['suspicious_sequence'] = score_process_sequence_temporal(processes)
 
-            # Validate that features are meaningful (not all defaults)
-            if has_meaningful_features(features):
-                success_count += 1
-            else:
-                default_count += 1
-                logger.warning(f"Event {i} has default features - check correlation quality")
+    # Co-occurrence scoring
+    features['suspicious_cooccurrence'] = score_process_cooccurrence(processes)
 
-            features['event_index'] = i
-            features['is_malicious'] = event.get('is_malicious', False)
-            features_list.append(features)
+    # Overall process suspicion
+    features['process_suspicion'] = max(
+        features['suspicious_sequence'],
+        features['suspicious_cooccurrence']
+    )
 
-        except Exception as e:
-            logger.warning(f"Failed to extract features for event {i}: {e}")
-            default_count += 1
-
-            # Add default features with error flag
-            features_list.append({
-                'event_index': i,
-                'is_malicious': event.get('is_malicious', False),
-                'user_is_admin': False,
-                'parent_child_suspicious': 0.0,
-                'is_business_hours': True,
-                'is_maintenance_window': False,
-                'feature_extraction_error': str(e)
-            })
-
-    feature_df = pd.DataFrame(features_list)
-
-    # Check if too many features are defaults (indicates correlation problems)
-    default_rate = default_count / len(correlated_events) if correlated_events else 0
-
-    logger.info("✅ Feature extraction complete:")
-    logger.info(f"   Success rate: {success_count}/{len(feature_df)} ({success_count/len(feature_df)*100:.1f}%)")
-    logger.info(f"   Default rate: {default_count}/{len(feature_df)} ({default_rate*100:.1f}%)")
-
-    if default_rate > 0.5:  # More than 50% defaults
-        logger.error("❌ High default feature rate - correlation may be failing!")
-        logger.error("   This suggests:")
-        logger.error("   1. No related processes/flows found for most auth events")
-        logger.error("   2. Computer ID formats don't match across files")
-        logger.error("   3. Timestamp formats are inconsistent")
-        logger.error("   Consider debugging correlation before proceeding")
-
-    elif default_rate > 0.2:  # More than 20% defaults
-        logger.warning("⚠️ Moderate default feature rate - check correlation quality")
-
-    else:
-        logger.info("✅ Feature extraction quality looks good")
-
-    return feature_df
+    return features
 
 
-def has_meaningful_features(features: Dict[str, Any]) -> bool:
+def score_process_sequence_temporal(processes: List[Dict]) -> float:
     """
-    Check if extracted features are meaningful (not all defaults)
+    Score suspicious temporal sequences without parent_process
 
-    Args:
-        features: Dictionary of extracted features
-
-    Returns:
-        True if features contain meaningful information
+    Heuristic: If office app appears before shell within 5 min,
+    likely suspicious (even without true parent-child link)
     """
-    # Check for non-default values in key features
-    meaningful_indicators = [
-        features.get('parent_child_suspicious', 0) > 0,
-        features.get('user_is_admin', False),
-        not features.get('is_business_hours', True),  # Unusual hours is meaningful
-        features.get('is_maintenance_window', False),
-        features.get('has_suspicious_processes', False),
-        features.get('external_connections', 0) > 0,
-        features.get('unusual_network_activity', False)
+    if len(processes) < 2:
+        return 0.0
+
+    # Sort by timestamp
+    sorted_procs = sorted(processes, key=lambda p: p.get('timestamp', 0))
+
+    suspicious_score = 0.0
+
+    # Define suspicious temporal sequences
+    SUSPICIOUS_SEQUENCES = [
+        # (precursor, follower, max_time_gap_sec, score)
+        (['winword.exe', 'excel.exe', 'outlook.exe'],
+         ['powershell.exe', 'cmd.exe'], 300, 0.8),
+        (['chrome.exe', 'firefox.exe', 'iexplore.exe'],
+         ['powershell.exe', 'cmd.exe'], 300, 0.6),
+        (['explorer.exe'],
+         ['net.exe', 'sc.exe', 'at.exe'], 300, 0.7),
     ]
 
-    return any(meaningful_indicators)
+    for i in range(len(sorted_procs) - 1):
+        current_proc = sorted_procs[i]['process_name'].lower()
+        current_time = sorted_procs[i].get('timestamp', 0)
+
+        for j in range(i+1, len(sorted_procs)):
+            next_proc = sorted_procs[j]['process_name'].lower()
+            next_time = sorted_procs[j].get('timestamp', current_time)
+            time_diff = next_time - current_time
+
+            # Check each suspicious sequence pattern
+            for precursors, followers, max_gap, score in SUSPICIOUS_SEQUENCES:
+                if time_diff <= max_gap:
+                    if any(p in current_proc for p in precursors):
+                        if any(f in next_proc for f in followers):
+                            suspicious_score = max(suspicious_score, score)
+
+    return min(suspicious_score, 1.0)
+
+
+def score_process_cooccurrence(processes: List[Dict]) -> float:
+    """
+    Check if suspicious process combinations occur in same session
+    Even without knowing parent-child, co-occurrence is suspicious
+    """
+    proc_names = [p.get('process_name', '').lower() for p in processes]
+    proc_set = set(proc_names)
+
+    SUSPICIOUS_COMBINATIONS = [
+        # (set of processes, score, description)
+        ({'winword.exe', 'powershell.exe'}, 0.8, 'Office + Shell'),
+        ({'outlook.exe', 'powershell.exe'}, 0.8, 'Email + Shell'),
+        ({'chrome.exe', 'powershell.exe'}, 0.6, 'Browser + Shell'),
+        ({'powershell.exe', 'net.exe'}, 0.7, 'Shell + Network tool'),
+        ({'cmd.exe', 'reg.exe'}, 0.6, 'Shell + Registry'),
+    ]
+
+    max_score = 0.0
+    for combo, score, desc in SUSPICIOUS_COMBINATIONS:
+        if combo.issubset(proc_set):
+            max_score = max(max_score, score)
+            logger.debug(f"Found suspicious combo: {desc}")
+
+    return max_score
+
+
+def extract_network_features(flows: List[Dict]) -> Dict:
+    """Extract network features from correlated flows"""
+    if not flows:
+        return {
+            'has_network': False,
+            'network_external': False,
+            'high_volume': False,
+            'network_suspicion': 0.0
+        }
+
+    features = {
+        'has_network': True,
+        'network_external': False,
+        'high_volume': False,
+        'network_suspicion': 0.0
+    }
+
+    # Analyze flows
+    for flow in flows:
+        dst_port = flow.get('dst_port', 0)
+
+        # External connections (common attack ports)
+        if dst_port in [80, 443, 53, 25, 110, 143, 993, 995]:
+            features['network_external'] = True
+
+        # High volume (>1MB)
+        byte_count = flow.get('byte_count', 0)
+        if byte_count > 1e6:
+            features['high_volume'] = True
+
+    # Suspicion score based on external + high volume
+    if features['network_external'] and features['high_volume']:
+        features['network_suspicion'] = 0.8
+    elif features['network_external']:
+        features['network_suspicion'] = 0.4
+    elif features['high_volume']:
+        features['network_suspicion'] = 0.3
+
+    return features
+
+
+def extract_dns_features(dns_queries: List[Dict]) -> Dict:
+    """Extract DNS features from correlated queries"""
+    if not dns_queries:
+        return {
+            'has_dns': False,
+            'dns_external': False,
+            'dns_suspicion': 0.0
+        }
+
+    features = {
+        'has_dns': True,
+        'dns_external': False,
+        'dns_suspicion': 0.0
+    }
+
+    # Analyze DNS queries
+    for query in dns_queries:
+        domain = query.get('domain', '').lower()
+
+        # External domains (not .local, .lan, internal)
+        if not any(x in domain for x in ['.local', '.lan', 'internal']):
+            features['dns_external'] = True
+
+    # Suspicion based on external DNS
+    if features['dns_external']:
+        features['dns_suspicion'] = 0.5
+
+    return features
+
+
+def extract_semantic_features_batch(events: List[Dict]) -> pd.DataFrame:
+    """
+    Batch extraction of semantic features for efficiency
+    """
+    all_features = []
+
+    for event in events:
+        features = {}
+
+        # Auth features
+        auth_event = event.get('auth_event', event)  # Handle both formats
+        features['user_id'] = auth_event.get('user_id', '')
+        features['timestamp'] = auth_event.get('timestamp')
+        features['auth_type'] = auth_event.get('auth_type', '')
+        features['outcome'] = auth_event.get('outcome', '')
+
+        # Semantic features
+        features['user_is_admin'] = 'admin' in str(features['user_id']).lower()
+        features['is_business_hours'] = False
+        features['is_maintenance_window'] = False
+        features['has_suspicious_processes'] = False
+        features['unusual_network_activity'] = False
+
+        if features['timestamp']:
+            hour = features['timestamp'].hour
+            features['is_business_hours'] = 9 <= hour <= 17
+            features['is_maintenance_window'] = 2 <= hour <= 5  # 2-5 AM maintenance
+
+        # Process features (simplified)
+        processes = event.get('related_processes', [])
+        if processes:
+            proc_names = [p.get('process_name', '').lower() for p in processes]
+            features['has_suspicious_processes'] = any(
+                'powershell' in p or 'cmd' in p for p in proc_names
+            )
+
+        # Network features (simplified)
+        flows = event.get('related_flows', [])
+        if flows:
+            features['unusual_network_activity'] = any(
+                f.get('dst_port', 0) in [80, 443, 53] for f in flows
+            )
+
+        # Overall suspicion
+        features['is_malicious'] = event.get('is_malicious', False)
+
+        all_features.append(features)
+
+    return pd.DataFrame(all_features)
+
+
+def extract_process_features_comprehensive(processes: List[Dict]) -> Dict:
+    """
+    Comprehensive process feature extraction for ablation study
+    """
+    return extract_process_features_fixed(processes)
